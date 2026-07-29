@@ -1,6 +1,6 @@
 {
-  "name": ""Wiki Test"",
-  "short_name": ""Wiki Test"",
+  "name": "Wiki Test",
+  "short_name": "Wiki Test",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
