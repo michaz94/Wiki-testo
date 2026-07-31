@@ -4,54 +4,23 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="theme-color" content="#0c0c0c">
-  <meta name="description" content="Wiki personnel hors ligne : projets, pages, fiches et galeries.">
   <title>Wiki</title>
-
-  <!-- Le thème est posé AVANT le premier rendu : plus de flash blanc
-       au lancement quand on est en thème sombre (et inversement). -->
-  <script>
-    (function () {
-      try {
-        var t = localStorage.getItem('theme') || 'dark';
-        document.documentElement.dataset.theme = t;
-        var meta = document.querySelector('meta[name="theme-color"]');
-        if (meta) meta.content = t === 'light' ? '#fbfbfb' : '#0c0c0c';
-      } catch (e) {}
-    })();
-  </script>
 
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./icon.svg" type="image/svg+xml">
-  <link rel="apple-touch-icon" href="./apple-touch-icon.png">
+  <link rel="apple-touch-icon" href="./icon.svg">
 
-  <!-- Police hébergée localement : l'app garde son identité hors ligne. -->
-  <link rel="preload" href="./rubik.woff2" as="font" type="font/woff2" crossorigin>
-  <style>
-    @font-face {
-      font-family: 'Rubik';
-      font-style: normal;
-      font-weight: 400 900;
-      font-display: swap;
-      src: url('./rubik.woff2') format('woff2-variations'),
-           url('./rubik.woff2') format('woff2');
-      unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6,
-                     U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F,
-                     U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF,
-                     U+FFFD;
-    }
-  </style>
-
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Rubik:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="./style.css">
 
-  <!-- sql.js en local. Le .wasm est résolu par locateFile dans app.js. -->
-  <script src="./sql-wasm.js"></script>
-
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/sql-wasm.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
   <style>
-    /* Styles réservés à l'impression / export PDF. */
+    /* print-only styles for PDF export */
     @media print {
-      .header-stack, .read-actions, .fab, .toolbar, .overlay,
-      .drawer-overlay, .toast, .save-page, .quick-page-menu,
-      .autosave, .update-bar { display: none !important; }
+      .header-stack, .read-actions, .fab, .toolbar, .overlay, .drawer-overlay, .toast, .save-page, .quick-page-menu { display: none !important; }
       html, body { background: var(--project-bg, #111) !important; }
       .page-body { max-width: 100% !important; margin: 0 !important; }
     }
@@ -63,75 +32,42 @@
   </div>
 
   <noscript>Cette application nécessite JavaScript.</noscript>
-
   <script type="module" src="./app.js"></script>
-
   <script>
-    /* ============================================================
-       1. Chargement du moteur PDF À LA DEMANDE
-       250 ko qu'on ne télécharge plus à chaque ouverture de l'app :
-       uniquement au moment où l'on appuie sur « Export PDF ».
-       ============================================================ */
-    window.loadHtml2Pdf = function () {
-      if (window.html2pdf) return Promise.resolve(window.html2pdf);
-      if (window.__html2pdfLoading) return window.__html2pdfLoading;
-
-      window.__html2pdfLoading = new Promise(function (resolve, reject) {
-        var s = document.createElement('script');
-        s.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js';
-        s.onload = function () { resolve(window.html2pdf); };
-        s.onerror = function () {
-          window.__html2pdfLoading = null;
-          reject(new Error('connexion requise'));
-        };
-        document.head.appendChild(s);
-      });
-      return window.__html2pdfLoading;
-    };
-
-    /* ============================================================
-       2. Service Worker + cycle de mise à jour maîtrisé
-       La nouvelle version s'installe puis attend. L'app est prévenue
-       par l'évènement « wiki:update-ready » et affiche un bandeau.
-       Rien ne bascule tant que l'utilisateur n'a pas appuyé.
-       ============================================================ */
+    /* Mise à jour en deux temps : le nouveau service worker s'installe
+       en silence, puis l'app propose « Recharger ». Rien n'est coupé
+       en pleine saisie. */
     if ('serviceWorker' in navigator) {
-      var refreshing = false;
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js').then(registration => {
+          const promptReload = () => {
+            const waiting = registration.waiting;
+            if (!waiting || document.querySelector('.sw-banner')) return;
 
-      navigator.serviceWorker.addEventListener('controllerchange', function () {
-        if (refreshing) return;
-        refreshing = true;
-        window.location.reload();
-      });
+            const bar = document.createElement('div');
+            bar.className = 'sw-banner';
+            bar.innerHTML = '<span>Nouvelle version disponible</span><button type="button">Recharger</button>';
+            document.body.appendChild(bar);
+            requestAnimationFrame(() => bar.classList.add('show'));
 
-      function announceUpdate(worker) {
-        window.__wikiWaitingWorker = worker;
-        window.dispatchEvent(new CustomEvent('wiki:update-ready'));
-      }
+            bar.querySelector('button').onclick = () => {
+              waiting.addEventListener('statechange', () => {
+                if (waiting.state === 'activated') window.location.reload();
+              });
+              waiting.postMessage('SKIP_WAITING');
+            };
+          };
 
-      /* Appelée par app.js quand on appuie sur « Recharger ». */
-      window.applyWikiUpdate = function () {
-        var worker = window.__wikiWaitingWorker;
-        if (worker) worker.postMessage('SKIP_WAITING');
-        else window.location.reload();
-      };
+          if (registration.waiting && navigator.serviceWorker.controller) promptReload();
 
-      window.addEventListener('load', function () {
-        navigator.serviceWorker.register('./sw.js').then(function (reg) {
-          if (reg.waiting && navigator.serviceWorker.controller) {
-            announceUpdate(reg.waiting);
-          }
-
-          reg.addEventListener('updatefound', function () {
-            var next = reg.installing;
-            if (!next) return;
-            next.addEventListener('statechange', function () {
-              if (next.state === 'installed' && navigator.serviceWorker.controller) {
-                announceUpdate(next);
-              }
+          registration.addEventListener('updatefound', () => {
+            const installing = registration.installing;
+            if (!installing) return;
+            installing.addEventListener('statechange', () => {
+              if (installing.state === 'installed' && navigator.serviceWorker.controller) promptReload();
             });
           });
-        }).catch(function (error) {
+        }).catch(error => {
           console.error('Erreur Service Worker :', error);
         });
       });
