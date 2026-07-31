@@ -3,15 +3,21 @@ import {
   Node,
   Extension,
   mergeAttributes,
-  InputRule
-} from 'https://esm.sh/@tiptap/core@2.11.5';
-import StarterKit from 'https://esm.sh/@tiptap/starter-kit@2.11.5';
+  InputRule,
+  StarterKit
+} from './tiptap.js';
 
 let db = null;
 let SQL = null;
 let editor = null;
 let stack = [{ name: 'home' }];
 let saveQueue = Promise.resolve();
+let editorFlush = null;
+/* Vidange synchrone du brouillon, appelée par cleanup() AVANT de
+   détruire l'éditeur : sans elle, quitter l'édition moins d'une
+   seconde après la dernière frappe perdait la saisie. */
+let editorFlushNow = null;
+let closeActiveMenu = null;
 
 const app = document.getElementById('app');
 const COLORS = ['#ffc500', '#4ecdc4', '#6bcb77', '#54a0ff', '#a78bfa', '#ff6b6b', '#ff9f43', '#f368e0'];
@@ -47,10 +53,39 @@ const normalize = value => String(value ?? '')
   .replace(/[\u0300-\u036f]/g, '')
   .toLowerCase();
 
+const plural = (count, word) => `${word}${count > 1 ? 's' : ''}`;
+
 function strip(html) {
   const documentHTML = new DOMParser().parseFromString(String(html || ''), 'text/html');
   return (documentHTML.body.textContent || '').replace(/\s+/g, ' ').trim();
 }
+
+/* Texte de recherche pré-calculé : évite de repasser un DOMParser
+   sur chaque page à chaque frappe. */
+/* « Sans titre » est un titre comme un autre : il doit être trouvable
+   par la recherche et se ranger à sa lettre dans le tri alphabétique. */
+const UNTITLED = 'Sans titre';
+const displayTitle = title => String(title ?? '').trim() || UNTITLED;
+
+const buildSearchText = (title, body, infobox) =>
+  normalize(`${displayTitle(title)} ${strip(body || '')} ${infoboxText(parseInfobox(infobox))}`);
+
+/* Même chose côté SQL : un titre vide est remplacé au moment du tri. */
+const TITLE_SORT = `COALESCE(NULLIF(TRIM(title), ''), '${UNTITLED}') COLLATE NOCASE`;
+
+/* Teinte stable dérivée du texte : deux pages gardent toujours leur
+   couleur, et une vignette sans image reste reconnaissable.
+   Remplace l'ancien dégradé vert qui traînait sur tout l'accueil. */
+function tintFor(text) {
+  const source = String(text || '?');
+  let hash = 0;
+  for (let index = 0; index < source.length; index++) {
+    hash = (hash * 31 + source.charCodeAt(index)) >>> 0;
+  }
+  return hash % 360;
+}
+
+const tintStyle = text => `--tint:${tintFor(text)}`;
 
 function fmt(timestamp) {
   const date = new Date(Number(timestamp));
@@ -77,10 +112,19 @@ function sanitizeHTML(html) {
     }
 
     [...element.attributes].forEach(attribute => {
-      const wikiId = element.tagName === 'A' && attribute.name === 'data-wikilink';
-      const wikiClass = element.tagName === 'A' && attribute.name === 'class' && attribute.value === 'wikilink';
-      if (!wikiId && !wikiClass) element.removeAttribute(attribute.name);
+      const isLink = element.tagName === 'A';
+      const wikiId = isLink && attribute.name === 'data-wikilink';
+      const wikiClass = isLink && attribute.name === 'class' && attribute.value === 'wikilink';
+      /* href n'était pas conservé : tout lien externe perdait sa cible. */
+      const safeHref = isLink && attribute.name === 'href'
+        && /^https?:\/\//i.test(attribute.value);
+      if (!wikiId && !wikiClass && !safeHref) element.removeAttribute(attribute.name);
     });
+
+    if (element.tagName === 'A' && element.getAttribute('href')) {
+      element.setAttribute('rel', 'noopener noreferrer');
+      element.setAttribute('target', '_blank');
+    }
   });
 
   return parsed.body.innerHTML;
@@ -117,6 +161,31 @@ const getPageCategories = id => q(`
   ORDER BY c.position
 `, [id]);
 
+/* Nombre de pages par catégorie, pour la pastille des vignettes. */
+function categoryCounts(spaceId) {
+  const rows = q(`
+    SELECT pc.category_id AS id, COUNT(*) AS n
+    FROM page_categories pc
+    JOIN categories c ON c.id = pc.category_id
+    JOIN pages p ON p.id = pc.page_id
+    WHERE c.space_id = ? AND p.deleted_at IS NULL
+    GROUP BY pc.category_id
+  `, [spaceId]);
+  return Object.fromEntries(rows.map(row => [row.id, row.n]));
+}
+
+/* Un seul SELECT au lieu d'une requête par vignette : la bibliothèque
+   affichait 300 pages = 300 requêtes, rejouées à chaque frappe. */
+let spaceCache = null;
+function spacesById() {
+  if (!spaceCache) {
+    spaceCache = new Map(q('SELECT * FROM spaces').map(space => [space.id, space]));
+  }
+  return spaceCache;
+}
+const spaceOf = id => (id ? spacesById().get(id) || null : null);
+const invalidateSpaces = () => { spaceCache = null; };
+
 function transaction(callback) {
   run('BEGIN');
   try {
@@ -132,8 +201,10 @@ function transaction(callback) {
 async function initDB() {
   if (typeof initSqlJs === 'undefined') throw new Error('SQL.js non chargé');
 
+  /* Moteur SQLite servi depuis le dossier de l'app : plus de CDN,
+     l'application démarre en mode avion. */
   SQL = await initSqlJs({
-    locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/${file}`
+    locateFile: file => `./${file}`
   });
 
   let bytes = null;
@@ -148,10 +219,10 @@ async function initDB() {
 
   db = bytes ? new SQL.Database(bytes) : new SQL.Database();
   run('PRAGMA foreign_keys = ON');
-  run('CREATE TABLE IF NOT EXISTS spaces (id TEXT PRIMARY KEY,name TEXT,emoji TEXT,color TEXT,created_at INTEGER,image TEXT,banner TEXT,home_body TEXT,model TEXT,accent_color TEXT,header_color TEXT,background_color TEXT,page_color TEXT)');
-  run('CREATE TABLE IF NOT EXISTS pages (id TEXT PRIMARY KEY,title TEXT,body TEXT,created_at INTEGER,updated_at INTEGER,is_inbox INTEGER DEFAULT 1,space_id TEXT,template_id TEXT,infobox TEXT,cover TEXT,is_pinned INTEGER DEFAULT 0,title_align TEXT DEFAULT "left")');
+  run("CREATE TABLE IF NOT EXISTS spaces (id TEXT PRIMARY KEY,name TEXT,emoji TEXT,color TEXT,created_at INTEGER,image TEXT,banner TEXT,home_body TEXT,model TEXT,accent_color TEXT,header_color TEXT,background_color TEXT,page_color TEXT)");
+  run("CREATE TABLE IF NOT EXISTS pages (id TEXT PRIMARY KEY,title TEXT,body TEXT,created_at INTEGER,updated_at INTEGER,is_inbox INTEGER DEFAULT 1,space_id TEXT,template_id TEXT,infobox TEXT,cover TEXT,is_pinned INTEGER DEFAULT 0,title_align TEXT DEFAULT 'left',search_text TEXT,deleted_at INTEGER)");
   run('CREATE TABLE IF NOT EXISTS templates (id TEXT PRIMARY KEY,name TEXT,emoji TEXT,fields TEXT,created_at INTEGER)');
-  run('CREATE TABLE IF NOT EXISTS categories (id TEXT PRIMARY KEY,space_id TEXT,name TEXT,intro TEXT,banner TEXT,template_id TEXT,position INTEGER,created_at INTEGER)');
+  run('CREATE TABLE IF NOT EXISTS categories (id TEXT PRIMARY KEY,space_id TEXT,name TEXT,intro TEXT,banner TEXT,template_id TEXT,position INTEGER,created_at INTEGER,parent_id TEXT,color TEXT)');
   run('CREATE TABLE IF NOT EXISTS page_categories (page_id TEXT,category_id TEXT,PRIMARY KEY(page_id,category_id))');
   run('CREATE TABLE IF NOT EXISTS page_gallery (id TEXT PRIMARY KEY,page_id TEXT,data_url TEXT,caption TEXT,position INTEGER,created_at INTEGER)');
 
@@ -167,7 +238,9 @@ async function initDB() {
     ['pages', 'infobox', 'TEXT'],
     ['pages', 'cover', 'TEXT'],
     ['pages', 'is_pinned', 'INTEGER DEFAULT 0'],
-    ['pages', 'title_align', 'TEXT DEFAULT "left"'],
+    ['pages', 'title_align', "TEXT DEFAULT 'left'"],
+    ['pages', 'search_text', 'TEXT'],
+    ['pages', 'deleted_at', 'INTEGER'],
     ['spaces', 'image', 'TEXT'],
     ['spaces', 'banner', 'TEXT'],
     ['spaces', 'home_body', 'TEXT'],
@@ -175,13 +248,75 @@ async function initDB() {
     ['spaces', 'accent_color', 'TEXT'],
     ['spaces', 'header_color', 'TEXT'],
     ['spaces', 'background_color', 'TEXT'],
-    ['spaces', 'page_color', 'TEXT']
+    ['spaces', 'page_color', 'TEXT'],
+    ['categories', 'parent_id', 'TEXT'],
+    ['categories', 'color', 'TEXT']
   ].forEach(item => ensureColumn(...item));
 
   run('CREATE INDEX IF NOT EXISTS idx_pages_space_updated ON pages(space_id, updated_at DESC)');
   run('CREATE INDEX IF NOT EXISTS idx_categories_space ON categories(space_id, position)');
   run('CREATE INDEX IF NOT EXISTS idx_gallery_page ON page_gallery(page_id, position)');
+  run('CREATE INDEX IF NOT EXISTS idx_pages_deleted ON pages(deleted_at)');
+
+  backfillSearchText();
+  backfillUntitled();
+  purgeTrash();
+
+  /* Sans cet appel, le navigateur peut purger la base sous pression disque. */
+  try { await navigator.storage.persist(); } catch { /* non bloquant */ }
+
   await saveDB();
+}
+
+/* ---- Corbeille ----
+   Une page supprimée n'est jamais détruite tout de suite : on pose
+   deleted_at, et la purge n'intervient qu'au lancement suivant, une fois
+   le délai écoulé. Toute requête qui liste des pages doit donc filtrer
+   sur « deleted_at IS NULL ». */
+const TRASH_DAYS = 30;
+
+function hardDeletePage(id) {
+  run('DELETE FROM page_gallery WHERE page_id = ?', [id]);
+  run('DELETE FROM page_categories WHERE page_id = ?', [id]);
+  run('DELETE FROM pages WHERE id = ?', [id]);
+}
+
+function purgeTrash() {
+  const cutoff = Date.now() - TRASH_DAYS * 86400000;
+  const doomed = q('SELECT id FROM pages WHERE deleted_at IS NOT NULL AND deleted_at < ?', [cutoff]);
+  if (!doomed.length) return 0;
+  transaction(() => doomed.forEach(({ id }) => hardDeletePage(id)));
+  return doomed.length;
+}
+
+const trashCount = () =>
+  q('SELECT COUNT(*) count FROM pages WHERE deleted_at IS NOT NULL')[0].count;
+
+function backfillSearchText() {
+  const missing = q('SELECT id, title, body, infobox FROM pages WHERE search_text IS NULL');
+  if (!missing.length) return;
+  transaction(() => {
+    missing.forEach(page => {
+      run('UPDATE pages SET search_text = ? WHERE id = ?', [buildSearchText(page.title, page.body, page.infobox), page.id]);
+    });
+  });
+}
+
+/* Les pages sans titre créées avant ce changement n'ont pas « sans titre »
+   dans leur index : on le rattrape une fois. */
+function backfillUntitled() {
+  const rows = q(`
+    SELECT id, title, body, infobox FROM pages
+    WHERE TRIM(COALESCE(title, '')) = ''
+      AND (search_text IS NULL OR search_text NOT LIKE '%sans titre%')
+  `);
+  if (!rows.length) return;
+  transaction(() => {
+    rows.forEach(page => {
+      run('UPDATE pages SET search_text = ? WHERE id = ?',
+        [buildSearchText(page.title, page.body, page.infobox), page.id]);
+    });
+  });
 }
 
 function saveDB() {
@@ -279,8 +414,22 @@ function applyPalette(palette) {
   document.body.style.setProperty('--context-text', contrast(palette.header));
   document.body.style.setProperty('--project-bg', palette.background);
   document.body.style.setProperty('--project-text', contrast(palette.background));
+  /* Le fond des articles prend une pointe de la couleur du projet,
+     comme le fait Fandom : chaque wiki garde une ambiance propre.
+     Repli explicite d'abord, au cas où color-mix ne soit pas supporté. */
   document.body.style.setProperty('--project-page-bg', palette.page);
+  document.body.style.setProperty(
+    '--project-page-bg',
+    `color-mix(in srgb, ${palette.header} 7%, ${palette.page})`
+  );
   document.body.style.setProperty('--project-page-text', contrast(palette.page));
+}
+
+/* La barre système Android suit toujours le header, jamais la couleur du projet. */
+function syncStatusBar() {
+  const value = getComputedStyle(document.body).getPropertyValue('--header-bg').trim();
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.content = value || '#0C0C0C';
 }
 
 function currentSpace() {
@@ -306,19 +455,41 @@ function applyTheme() {
       '--project-bg', '--project-text', '--project-page-bg', '--project-page-text'
     ].forEach(property => document.body.style.removeProperty(property));
     if (stack.at(-1)?.name === 'home') {
-      const appearance = getHomeAppearance();
-      applyHomeAppearance(appearance);
-      document.querySelector('meta[name="theme-color"]').content = appearance.header;
-    } else {
-      document.querySelector('meta[name="theme-color"]').content = '#0C0C0C';
+      applyHomeAppearance(getHomeAppearance());
     }
+    syncStatusBar();
     return;
   }
 
-  const palette = getSpacePalette(space);
-  applyPalette(palette);
-  document.querySelector('meta[name="theme-color"]').content = palette.header;
+  applyPalette(getSpacePalette(space));
+  syncStatusBar();
 }
+
+/* ============================================================
+   Icônes du drawer
+   Tracés SVG plutôt qu'emoji : ils suivent currentColor, donc le
+   thème, et s'affichent pareil sur tous les téléphones.
+   ============================================================ */
+const ICON_PATHS = {
+  home: '<path d="M3 10.5 12 3l9 7.5"/><path d="M5.5 9.5V21h13V9.5"/>',
+  inbox: '<path d="M3 13h5l1.5 3h5L16 13h5"/><path d="M4.5 13 6 4.5h12L19.5 13V19a1 1 0 0 1-1 1h-13a1 1 0 0 1-1-1z"/>',
+  pages: '<circle cx="12" cy="12" r="9"/><path d="M15.5 8.5 13 13.5l-5 2 2.5-5z"/>',
+  pin: '<path d="M6.5 3h11v18l-5.5-4.2L6.5 21z"/>',
+  templates: '<rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><path d="M17 13.8v6.4M13.8 17h6.4"/>',
+  trash: '<path d="M4 6.5h16"/><path d="M9.5 6.5V4.2h5v2.3"/><path d="M6.5 6.5 7.4 20a1 1 0 0 0 1 .9h7.2a1 1 0 0 0 1-.9l.9-13.5"/><path d="M10.5 10.5v6M13.5 10.5v6"/>',
+  export: '<path d="M12 3.5v11"/><path d="M8 11l4 4 4-4"/><path d="M4.5 16v3a1.5 1.5 0 0 0 1.5 1.5h12a1.5 1.5 0 0 0 1.5-1.5v-3"/>',
+  import: '<path d="M12 15.5v-11"/><path d="M8 8.5l4-4 4 4"/><path d="M4.5 16v3a1.5 1.5 0 0 0 1.5 1.5h12a1.5 1.5 0 0 0 1.5-1.5v-3"/>',
+  theme: '<circle cx="12" cy="12" r="8.5"/><path d="M12 3.5a8.5 8.5 0 0 0 0 17z" fill="currentColor" stroke="none"/>',
+  settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 14.5a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5v.2a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1h.2a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/>',
+  close: '<path d="M5.5 5.5l13 13M18.5 5.5l-13 13"/>',
+  folder: '<path d="M3.5 6.8a1.3 1.3 0 0 1 1.3-1.3h4l2 2.4h7.9a1.3 1.3 0 0 1 1.3 1.3v9.3a1.3 1.3 0 0 1-1.3 1.3H4.8a1.3 1.3 0 0 1-1.3-1.3z"/>',
+  doc: '<path d="M6.5 3.5h7l4.5 4.5v12a1 1 0 0 1-1 1h-10a1 1 0 0 1-1-1v-15a1 1 0 0 1 1-1z"/><path d="M13.5 3.5V8h4.5"/>'
+};
+
+const icon = (name, size = 20) =>
+  `<svg class="ico" viewBox="0 0 24 24" width="${size}" height="${size}" fill="none"
+        stroke="currentColor" stroke-width="1.7" stroke-linecap="round"
+        stroke-linejoin="round" aria-hidden="true">${ICON_PATHS[name] || ''}</svg>`;
 
 const logoHTML = () => '<span class="logo"><span class="w">W</span>iki</span>';
 
@@ -328,8 +499,9 @@ function globalHeader(title = '') {
       <button type="button" class="menu-btn" id="openMenu" aria-label="Menu global">
         <span></span><span></span><span></span>
       </button>
-      ${logoHTML()}
-      ${title ? `<div class="title">${esc(title)}</div>` : ''}
+      ${title
+        ? `<div class="title">${esc(title)}</div>`
+        : `<button type="button" class="logo" id="logoHome"><span class="w">W</span>iki</button>`}
       <div class="header-actions">
         <button type="button" class="search-icon-btn" id="searchBtn" aria-label="Rechercher">Rechercher</button>
       </div>
@@ -343,7 +515,7 @@ function contextBar(space, page = null) {
   return `
     <div class="top-context">
       <button type="button" class="ctx-toc-btn" id="ctxToc" aria-label="Menu du projet">☷</button>
-      <div class="ctx-body"><div class="ctx-name">${esc(page?.title || space.name)}</div></div>
+      <div class="ctx-body"><div class="ctx-name">${esc(displayTitle(page?.title || space.name))}</div></div>
       ${page ? `<button type="button" class="ctx-action" id="ctxPin" aria-label="${page.is_pinned ? 'Désépingler' : 'Épingler'}" aria-pressed="${Boolean(page.is_pinned)}">${page.is_pinned ? '★' : '☆'}</button>` : ''}
     </div>
   `;
@@ -356,57 +528,86 @@ function wrapHeader(space, page, main) {
 function bindGlobal() {
   document.getElementById('openMenu')?.addEventListener('click', openGlobalDrawer);
   document.getElementById('searchBtn')?.addEventListener('click', () => go('search'));
+  document.getElementById('logoHome')?.addEventListener('click', goHome);
   document.getElementById('ctxToc')?.addEventListener('click', openContextDrawer);
   document.getElementById('ctxPin')?.addEventListener('click', () => togglePin(stack.at(-1).param));
 }
 
 function pageCard(page) {
+  const text = strip(page.body);
+  const space = spaceOf(page.space_id);
   return `
     <button type="button" class="card page-card" data-page="${esc(page.id)}">
-      <div class="t">${esc(page.title?.trim() || 'Sans titre')}${page.is_pinned ? ' ★' : ''}</div>
-      ${strip(page.body) ? `<div class="p">${esc(strip(page.body).slice(0, 130))}</div>` : ''}
-      <div class="d">${fmt(page.updated_at)}</div>
+      <div class="t">${esc(displayTitle(page.title))}${page.is_pinned ? ' ★' : ''}</div>
+      ${text
+        ? `<div class="p">${esc(text.slice(0, 130))}</div>`
+        : '<div class="p vide">Page vide</div>'}
+      <div class="d">${esc(space?.name || 'Inbox')} · ${fmt(page.updated_at)}</div>
     </button>
   `;
 }
 
 function rcard(page) {
-  const space = page.space_id ? getSpace(page.space_id) : null;
+  const space = spaceOf(page.space_id);
+  const cover = safeImage(page.cover);
+  const title = displayTitle(page.title);
+  const initial = esc(title[0] || '?');
+  const iconImage = space ? safeImage(space.image) : '';
+  const iconColor = space ? getSpacePalette(space).accent : '#3d3d3c';
+
   return `
     <div class="rcard-shell">
       <button type="button" class="rcard" data-page="${esc(page.id)}">
-        <div class="rcard-img">${safeImage(page.cover) ? `<img src="${esc(safeImage(page.cover))}" alt="">` : ''}</div>
-        <div class="rcard-t">${esc(page.title?.trim() || 'Sans titre')}</div>
-        <div class="rcard-m"><span>${space?.emoji || '📥'}</span><span>${esc(space?.name || 'Inbox')}</span></div>
+        <div class="rcard-img">${cover
+          ? `<img src="${esc(cover)}" alt="" loading="lazy">`
+          : `<span class="rcard-ph tinted" style="${tintStyle(title)}">${initial}</span>`}</div>
+        <div class="rcard-t">${esc(title)}</div>
+        <div class="rcard-m">
+          <span class="rcard-ico" data-space-icon="${esc(iconImage)}"
+                style="background-color:${iconColor};color:${contrast(iconColor)}">${iconImage ? '' : esc(space ? (space.emoji || space.name[0]) : '📥')}</span>
+          <span>${esc(space?.name || 'Inbox')}</span>
+        </div>
       </button>
       <button
         type="button"
         class="rcard-menu-button"
         data-recent-menu="${esc(page.id)}"
-        aria-label="Actions pour ${esc(page.title?.trim() || 'Sans titre')}"
+        aria-label="Actions pour ${esc(title)}"
       >⋮</button>
     </div>
   `;
 }
 
 function entityCard(page) {
+  const title = displayTitle(page.title);
   return `
     <button type="button" class="entity-card" data-page="${esc(page.id)}">
-      ${safeImage(page.cover) ? `<img src="${esc(safeImage(page.cover))}" alt="">` : `<div class="entity-placeholder">${esc((page.title || '?')[0])}</div>`}
-      <span class="entity-name">${esc(page.title?.trim() || 'Sans titre')}</span>
+      ${safeImage(page.cover)
+        ? `<img src="${esc(safeImage(page.cover))}" alt="" loading="lazy">`
+        : `<div class="entity-placeholder tinted" style="${tintStyle(title)}">${esc(title[0])}</div>`}
+      <span class="entity-name">${esc(title)}</span>
     </button>
   `;
 }
 
-function portalCard(category) {
+function portalCard(category, count = 0) {
   const banner = safeImage(category.banner);
   return `
     <button type="button" class="portal-card${banner ? '' : ' portal-card--empty'}" data-category="${esc(category.id)}">
-      ${banner ? `<img src="${esc(banner)}" alt="">` : `<div class="portal-placeholder">${esc(category.name[0])}</div>`}
+      ${banner
+        ? `<img src="${esc(banner)}" alt="" loading="lazy">`
+        : `<div class="portal-placeholder tinted" style="${tintStyle(category.name)}">${esc(category.name[0])}</div>`}
       <span class="portal-name">${esc(category.name)}</span>
-      <span class="portal-mark" aria-hidden="true">+</span>
+      <span class="portal-mark">${count}</span>
     </button>
   `;
+}
+
+function paintSpaceIcons(root = app) {
+  root.querySelectorAll('[data-space-icon]').forEach(element => {
+    const image = element.dataset.spaceIcon;
+    if (image) element.style.backgroundImage = `url("${image.replace(/"/g, '%22')}")`;
+  });
 }
 
 function wirePages(root = app) {
@@ -420,16 +621,21 @@ function wirePages(root = app) {
 
 function screenHome() {
   const spaces = q('SELECT * FROM spaces ORDER BY created_at');
-  const recent = q('SELECT id,title,cover,space_id,updated_at FROM pages ORDER BY updated_at DESC LIMIT 8');
-  const inbox = q('SELECT COUNT(*) count FROM pages WHERE space_id IS NULL')[0].count;
+  const recent = q('SELECT id,title,cover,space_id,updated_at FROM pages WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 8');
+  const inbox = q('SELECT COUNT(*) count FROM pages WHERE space_id IS NULL AND deleted_at IS NULL')[0].count;
+  const pinned = q('SELECT id,title,cover,space_id,updated_at FROM pages WHERE is_pinned = 1 AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT 8');
 
   app.innerHTML = `
     ${globalHeader()}
     <main>
+      ${pinned.length ? `
+        <div class="sec-row"><div class="sec">★ Épinglées</div><button type="button" class="sec-link" id="pinnedAll">Voir tout</button></div>
+        <div class="hscroll">${pinned.map(rcard).join('')}</div>
+      ` : ''}
       <div class="sec-row"><div class="sec">Re-plongez-vous</div><button type="button" class="sec-link" id="recentAll">Voir tout</button></div>
       <div class="hscroll">${recent.map(rcard).join('') || '<div class="empty">Rien pour le moment.</div>'}</div>
       <div class="sec">Mes projets</div>
-      <div class="hscroll avatars">
+      <div class="hscroll avatars grid-projects">
         ${spaces.map(space => {
           const image = safeImage(space.image);
           const iconColor = getSpacePalette(space).accent;
@@ -447,13 +653,15 @@ function screenHome() {
   app.querySelectorAll('[data-avatar-image]').forEach(element => {
     if (element.dataset.avatarImage) element.style.backgroundImage = `url("${element.dataset.avatarImage.replace(/"/g, '%22')}")`;
   });
+  paintSpaceIcons();
   app.querySelectorAll('[data-space]').forEach(element => {
     element.addEventListener('click', () => go('space', element.dataset.space));
   });
   document.getElementById('newSpace').onclick = () => go('newspace');
   document.getElementById('toInbox').onclick = () => go('inbox');
   document.getElementById('toTemplates').onclick = () => go('templates');
-  document.getElementById('recentAll').onclick = () => go('recent');
+  document.getElementById('recentAll').onclick = () => go('library', 'all');
+  document.getElementById('pinnedAll')?.addEventListener('click', () => go('library', 'pinned'));
   document.getElementById('fab').onclick = () => quickNote(null);
   wirePages();
   app.querySelectorAll('[data-recent-menu]').forEach(button => {
@@ -499,6 +707,7 @@ function screenNewSpace() {
         run('INSERT INTO categories (id,space_id,name,intro,banner,position,created_at) VALUES (?,?,?,?,?,?,?)', [uid(), id, category, '', '', position, now]);
       });
     });
+    invalidateSpaces();
     await saveDB();
     go('space', id);
   };
@@ -508,19 +717,51 @@ function screenSpace(id) {
   const space = getSpace(id);
   if (!space) return goHome();
   const categories = getSpaceCategories(id);
-  const pages = q('SELECT * FROM pages WHERE space_id = ? ORDER BY updated_at DESC', [id]);
+  const counts = categoryCounts(id);
+  const pages = q('SELECT * FROM pages WHERE space_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC', [id]);
+  const illustrated = pages.filter(page => page.cover).length;
+  const banner = safeImage(space.banner);
+  const logo = safeImage(space.image);
 
   app.innerHTML = `
     ${wrapHeader(space, null, globalHeader())}
     <main class="project-home">
-      ${safeImage(space.banner) ? `<div class="space-hero"><img src="${esc(safeImage(space.banner))}" alt=""></div>` : ''}
-      <section class="project-intro">
-        <div class="project-body">${esc(space.home_body || 'Ce projet n’a pas encore d’introduction.')}</div>
-        <div class="project-actions"><button type="button" class="action-link" id="editSpace">Modifier le projet</button><button type="button" class="action-link" id="randomPage">Page au hasard</button></div>
+      <section class="space-banner${banner ? '' : ' space-banner--plain'}" style="${tintStyle(space.name)}">
+        ${banner ? `<img class="space-banner-img" src="${esc(banner)}" alt="">` : ''}
+        <div class="space-banner-veil"></div>
+        <div class="space-banner-row">
+          <span class="space-logo" data-space-icon="${esc(logo)}"
+                style="background-color:${getSpacePalette(space).accent};color:${contrast(getSpacePalette(space).accent)}">${logo ? '' : esc(space.emoji || space.name[0])}</span>
+          <span class="space-banner-id">
+            <span class="space-banner-name">${esc(space.name)}</span>
+            <span class="space-banner-sub">${esc(MODELS[space.model]?.label || 'Projet')}</span>
+          </span>
+          <span class="space-banner-count">
+            <b>${pages.length}</b><span>${plural(pages.length, 'PAGE')}</span>
+          </span>
+        </div>
       </section>
-      <div class="project-stats"><div class="project-stat"><b>${pages.length}</b><span>Pages</span></div><div class="project-stat"><b>${categories.length}</b><span>Catégories</span></div><div class="project-stat"><b>${pages.filter(page => page.cover).length}</b><span>Illustrées</span></div></div>
-      <div class="sec project-section-title">Catégories</div>
-      ${categories.length ? `<div class="portal-grid">${categories.map(portalCard).join('')}</div>` : '<div class="category-empty">Aucune catégorie.</div>'}
+
+      <article class="project-card">
+        <div class="project-card-head">
+          <h1 class="project-title">${esc(space.name)}</h1>
+          <div class="project-card-actions">
+            <button type="button" class="action-link" id="editSpace"><span class="ai">✎</span>Modifier</button>
+            <button type="button" class="action-link icon-only" id="spaceMore" aria-label="Plus d'actions">⋮</button>
+          </div>
+        </div>
+        <div class="project-body">${esc(space.home_body || 'Ce projet n’a pas encore d’introduction.')}</div>
+        <div class="project-stats">
+          <div class="project-stat"><b>${pages.length}</b><span>${plural(pages.length, 'Page')}</span></div>
+          <div class="project-stat"><b>${categories.length}</b><span>Catégories</span></div>
+          <div class="project-stat"><b>${illustrated}</b><span>${plural(illustrated, 'Illustrée')}</span></div>
+        </div>
+      </article>
+
+      <div class="sec-row"><div class="sec">Catégories</div><button type="button" class="sec-link" id="newCategory">+ Ajouter</button></div>
+      ${categories.length
+        ? `<div class="portal-grid">${categories.map(category => portalCard(category, counts[category.id] || 0)).join('')}</div>`
+        : '<div class="category-empty">Aucune catégorie.<br>Ajoute-en une pour organiser tes pages.</div>'}
       <div class="sec-row"><div class="sec">Dernières pages</div><button type="button" class="sec-link" id="allPages">Voir tout</button></div>
       ${pages.slice(0, 4).map(pageCard).join('') || '<div class="empty project-empty">Aucune page dans ce projet.</div>'}
     </main>
@@ -528,13 +769,61 @@ function screenSpace(id) {
   `;
 
   bindGlobal();
+  paintSpaceIcons();
   document.getElementById('editSpace').onclick = () => editSpace(space);
-  document.getElementById('allPages').onclick = openContextDrawer;
+  document.getElementById('newCategory').onclick = () => createCategory(space.id);
+  document.getElementById('allPages').onclick = () => go('library', `space:${id}`);
   document.getElementById('fab').onclick = () => quickNote(id);
-  document.getElementById('randomPage').onclick = () => pages.length
-    ? go('read', pages[Math.floor(Math.random() * pages.length)].id)
-    : toast('Aucune page dans ce projet.');
+  document.getElementById('spaceMore').onclick = event => buildMenu(event.currentTarget, [
+    {
+      label: 'Page au hasard',
+      run: () => pages.length
+        ? go('read', pages[Math.floor(Math.random() * pages.length)].id)
+        : toast('Aucune page dans ce projet.')
+    },
+    { label: 'Importer depuis JSON', run: () => importJSON(id) },
+    { label: 'Toutes les pages', run: () => go('library', `space:${id}`) },
+    { label: 'Modifier le projet', run: () => editSpace(space) }
+  ]);
   wirePages();
+}
+
+/* Sans ce dialogue, les modèles « Vrac » et « Vierge » ne pouvaient
+   jamais recevoir la moindre catégorie. */
+function createCategory(spaceId) {
+  openDialog('Nouvelle catégorie', `
+    <form id="newCatForm">
+      <label class="lab" for="newCatName">Nom</label>
+      <input class="field" id="newCatName" maxlength="80" required placeholder="Personnages, Lieux, Notes...">
+      <label class="lab" for="newCatIntro">Introduction (optionnel)</label>
+      <textarea class="field" id="newCatIntro" rows="3"></textarea>
+      <button class="btn-accent quick" type="submit">Créer la catégorie</button>
+    </form>
+  `, dialog => {
+    const input = dialog.querySelector('#newCatName');
+    input.focus();
+
+    dialog.querySelector('#newCatForm').onsubmit = async event => {
+      event.preventDefault();
+      const name = input.value.trim();
+      if (!name) return toast('Donne un nom à la catégorie.', true);
+
+      const max = q('SELECT MAX(position) position FROM categories WHERE space_id = ?', [spaceId])[0].position;
+      run('INSERT INTO categories (id,space_id,name,intro,banner,position,created_at) VALUES (?,?,?,?,?,?,?)', [
+        uid(),
+        spaceId,
+        name,
+        dialog.querySelector('#newCatIntro').value.trim(),
+        null,
+        (max ?? -1) + 1,
+        Date.now()
+      ]);
+      await saveDB();
+      dialog.remove();
+      render();
+      toast('Catégorie créée.');
+    };
+  });
 }
 
 function editSpace(space) {
@@ -544,6 +833,9 @@ function editSpace(space) {
 
   openDialog('Modifier le projet', `
     <form id="spaceEditForm">
+      <label class="lab" for="spaceNameEdit">Nom du projet</label>
+      <input class="field" id="spaceNameEdit" maxlength="80" value="${esc(space.name)}" required>
+
       <label class="lab" for="homeBody">Introduction</label><textarea class="field" id="homeBody" rows="6">${esc(space.home_body || '')}</textarea>
 
       <fieldset class="project-images-editor">
@@ -589,6 +881,11 @@ function editSpace(space) {
       </fieldset>
 
       <button class="btn-accent quick" type="submit">Enregistrer</button>
+
+      <div class="danger-zone">
+        <p>Supprimer ce projet conserve ses pages : elles retournent dans l'Inbox. Les catégories, elles, sont perdues.</p>
+        <button type="button" class="btn-danger" id="deleteSpace">Supprimer le projet</button>
+      </div>
     </form>
   `, dialog => {
     let resetTheme = false;
@@ -639,6 +936,11 @@ function editSpace(space) {
     dialog.querySelector('#removeProjectBanner').onclick = () => {
       projectBanner = null;
       updateImagePreviews();
+    };
+
+    dialog.querySelector('#deleteSpace').onclick = () => {
+      dialog.remove();
+      deleteSpace(space);
     };
 
     const readPalette = () => Object.fromEntries(controls.map(([id, key]) => [
@@ -713,6 +1015,9 @@ function editSpace(space) {
     dialog.querySelector('#spaceEditForm').onsubmit = async event => {
       event.preventDefault();
 
+      const name = dialog.querySelector('#spaceNameEdit').value.trim();
+      if (!name) return toast('Le nom du projet est obligatoire.', true);
+
       const palette = readPalette();
       if (Object.values(palette).some(value => !value)) {
         return toast('Vérifie les codes couleur. Utilise #RGB ou #RRGGBB.', true);
@@ -720,10 +1025,11 @@ function editSpace(space) {
 
       run(`
         UPDATE spaces
-        SET home_body = ?, image = ?, banner = ?, accent_color = ?, header_color = ?,
+        SET name = ?, home_body = ?, image = ?, banner = ?, accent_color = ?, header_color = ?,
             background_color = ?, page_color = ?
         WHERE id = ?
       `, [
+        name,
         dialog.querySelector('#homeBody').value.trim(),
         projectImage,
         projectBanner,
@@ -733,10 +1039,36 @@ function editSpace(space) {
         resetTheme ? null : palette.page,
         space.id
       ]);
+      invalidateSpaces();
       await saveDB();
       dialog.remove();
       render();
     };
+  });
+}
+
+/* Suppression douce : les pages ne disparaissent jamais, elles reviennent
+   dans l'Inbox. Seules les catégories du projet sont détruites. */
+function deleteSpace(space) {
+  const pages = q('SELECT COUNT(*) count FROM pages WHERE space_id = ? AND deleted_at IS NULL', [space.id])[0].count;
+  const message = pages
+    ? `${pages} ${plural(pages, 'page')} ${pages > 1 ? 'retourneront' : 'retournera'} dans l'Inbox. Les catégories du projet seront supprimées.`
+    : 'Ce projet ne contient aucune page. Ses catégories seront supprimées.';
+
+  confirmDialog(`Supprimer « ${space.name} » ?`, message, async () => {
+    transaction(() => {
+      const categoryIds = q('SELECT id FROM categories WHERE space_id = ?', [space.id]).map(row => row.id);
+      categoryIds.forEach(categoryId => {
+        run('DELETE FROM page_categories WHERE category_id = ?', [categoryId]);
+      });
+      run('DELETE FROM categories WHERE space_id = ?', [space.id]);
+      run('UPDATE pages SET space_id = NULL, is_inbox = 1 WHERE space_id = ?', [space.id]);
+      run('DELETE FROM spaces WHERE id = ?', [space.id]);
+    });
+    invalidateSpaces();
+    await saveDB();
+    goHome();
+    toast('Projet supprimé. Les pages sont dans l\'Inbox.');
   });
 }
 
@@ -772,20 +1104,22 @@ function screenCategory(id) {
   const category = getCategory(id);
   if (!category) return goHome();
   const space = getSpace(category.space_id);
-  const pages = q('SELECT p.* FROM pages p JOIN page_categories pc ON pc.page_id = p.id WHERE pc.category_id = ? ORDER BY p.updated_at DESC', [id]);
+  const pages = q('SELECT p.* FROM pages p JOIN page_categories pc ON pc.page_id = p.id WHERE pc.category_id = ? AND p.deleted_at IS NULL ORDER BY p.updated_at DESC', [id]);
 
   app.innerHTML = `
     ${wrapHeader(space, null, globalHeader())}
     <main>
       ${safeImage(category.banner) ? `<div class="category-hero"><img src="${esc(safeImage(category.banner))}" alt=""></div>` : ''}
       <section class="category-heading"><div class="category-heading-row"><h1>${esc(category.name)}</h1><button type="button" class="btn-ghost" id="editCategory">Modifier</button></div>${category.intro ? `<p>${esc(category.intro)}</p>` : ''}</section>
-      ${pages.length ? `<div class="entity-grid">${pages.map(entityCard).join('')}</div>` : '<div class="category-empty">Cette catégorie est vide.<br>Crée une page pour commencer.</div>'}
+      ${pages.length ? `<div class="entity-grid">${pages.slice(0, 12).map(entityCard).join('')}</div>` : '<div class="category-empty">Cette catégorie est vide.<br>Crée une page pour commencer.</div>'}
+      ${pages.length > 12 ? `<button type="button" class="btn-ghost quick" id="catAll">Voir les ${pages.length} pages</button>` : ''}
       <button type="button" class="btn-accent quick" id="newCatPage">+ Nouvelle page</button>
     </main>
   `;
 
   bindGlobal();
   document.getElementById('editCategory').onclick = () => editCategory(category);
+  document.getElementById('catAll')?.addEventListener('click', () => go('library', `cat:${id}`));
   document.getElementById('newCatPage').onclick = () => quickNote(space.id, id);
   wirePages();
 }
@@ -797,8 +1131,18 @@ function editCategory(category) {
       <label class="lab" for="catIntro">Introduction</label><textarea class="field" id="catIntro" rows="4">${esc(category.intro || '')}</textarea>
       <label class="lab" for="catBanner">Bannière HTTPS</label><input class="field" id="catBanner" value="${esc(category.banner || '')}">
       <button class="btn-accent quick" type="submit">Enregistrer</button>
+
+      <div class="danger-zone">
+        <p>Supprimer la catégorie ne supprime aucune page : elles restent dans le projet, simplement déclassées.</p>
+        <button type="button" class="btn-danger" id="deleteCategory">Supprimer la catégorie</button>
+      </div>
     </form>
   `, dialog => {
+    dialog.querySelector('#deleteCategory').onclick = () => {
+      dialog.remove();
+      deleteCategory(category);
+    };
+
     dialog.querySelector('#categoryEditForm').onsubmit = async event => {
       event.preventDefault();
       const name = dialog.querySelector('#catName').value.trim();
@@ -813,7 +1157,27 @@ function editCategory(category) {
   });
 }
 
-async function quickNote(spaceId, categoryId = null) {
+/* Fandom prévient : supprimer une catégorie ne la retire pas des pages.
+   Ici on nettoie page_categories pour ne pas laisser de liaisons fantômes. */
+function deleteCategory(category) {
+  const count = q('SELECT COUNT(*) count FROM page_categories pc JOIN pages p ON p.id = pc.page_id WHERE pc.category_id = ? AND p.deleted_at IS NULL', [category.id])[0].count;
+  const message = count
+    ? `${count} ${plural(count, 'page')} ${count > 1 ? 'perdront' : 'perdra'} cette catégorie, mais ${count > 1 ? 'resteront' : 'restera'} dans le projet.`
+    : 'Cette catégorie ne contient aucune page.';
+
+  confirmDialog(`Supprimer « ${category.name} » ?`, message, async () => {
+    const spaceId = category.space_id;
+    transaction(() => {
+      run('DELETE FROM page_categories WHERE category_id = ?', [category.id]);
+      run('DELETE FROM categories WHERE id = ?', [category.id]);
+    });
+    await saveDB();
+    replaceCurrent('space', spaceId);
+    toast('Catégorie supprimée.');
+  });
+}
+
+async function quickNote(spaceId, categoryId = null, title = '') {
   try {
     if (categoryId && getCategory(categoryId)?.space_id !== spaceId) {
       throw new Error('La catégorie ne correspond pas au projet.');
@@ -821,7 +1185,7 @@ async function quickNote(spaceId, categoryId = null) {
     const id = uid();
     const now = Date.now();
     transaction(() => {
-      run('INSERT INTO pages (id,title,body,created_at,updated_at,is_inbox,space_id,infobox,title_align) VALUES (?,?,?,?,?,?,?,?,?)', [id, '', '', now, now, spaceId ? 0 : 1, spaceId, '{}', 'left']);
+      run('INSERT INTO pages (id,title,body,created_at,updated_at,is_inbox,space_id,infobox,title_align,search_text) VALUES (?,?,?,?,?,?,?,?,?,?)', [id, title, '', now, now, spaceId ? 0 : 1, spaceId, '{}', 'left', buildSearchText(title, '', '{}')]);
       if (categoryId) run('INSERT INTO page_categories (page_id,category_id) VALUES (?,?)', [id, categoryId]);
     });
     await saveDB();
@@ -832,51 +1196,653 @@ async function quickNote(spaceId, categoryId = null) {
 }
 
 function screenInbox() {
-  const pages = q('SELECT id,title,body,updated_at,is_pinned FROM pages WHERE space_id IS NULL ORDER BY updated_at DESC');
-  app.innerHTML = `${globalHeader('Inbox')}<main>${pages.map(pageCard).join('') || '<div class="empty">Rien dans l’Inbox.</div>'}</main><button type="button" class="fab" id="fab" aria-label="Nouvelle note">+</button>`;
-  bindGlobal();
-  document.getElementById('fab').onclick = () => quickNote(null);
-  wirePages();
+  replaceCurrent('library', 'inbox');
 }
 
-function screenRecent() {
-  const pages = q('SELECT id,title,body,updated_at,is_pinned FROM pages ORDER BY updated_at DESC');
-  app.innerHTML = `${globalHeader('Pages récentes')}<main>${pages.map(pageCard).join('') || '<div class="empty">Aucune page.</div>'}</main>`;
-  bindGlobal();
-  wirePages();
+/* ============================================================
+   Bibliothèque : un seul écran pour « toutes les pages », les pages
+   d'un projet, celles d'une catégorie et les épinglées. Seule la
+   clause WHERE change.
+   ============================================================ */
+
+/* Le champ de tri et le sens sont séparés : 4 champs × 2 sens,
+   au lieu de 6 combinaisons figées. */
+const SORTS = {
+  updated: { label: 'Date de modification', col: 'updated_at',            down: 'Récentes d\'abord', up: 'Anciennes d\'abord' },
+  created: { label: 'Date de création',     col: 'created_at',            down: 'Récentes d\'abord', up: 'Anciennes d\'abord' },
+  title:   { label: 'Titre',                col: TITLE_SORT,              down: 'Z → A',             up: 'A → Z' },
+  weight:  { label: 'Taille du texte',      col: 'LENGTH(search_text)',   down: 'Les plus longues',  up: 'Les plus courtes' }
+};
+
+let currentSort = SORTS[localStorage.getItem('wiki-sort')] ? localStorage.getItem('wiki-sort') : 'updated';
+let sortDesc = localStorage.getItem('wiki-sort-desc') !== '0';
+let listView = localStorage.getItem('wiki-view') || 'grid';
+let selection = new Set();
+
+const sortClause = () => `${SORTS[currentSort].col} ${sortDesc ? 'DESC' : 'ASC'}`;
+const sortLabel = () => `${SORTS[currentSort].label} · ${sortDesc ? SORTS[currentSort].down : SORTS[currentSort].up}`;
+
+/* Une carte, deux rendus. La logique ne doit exister qu'une fois. */
+function pageTile(page, view) {
+  const space = spaceOf(page.space_id);
+  const cover = safeImage(page.cover);
+  const text = strip(page.body);
+  const title = displayTitle(page.title);
+  const initial = esc(title[0] || '?');
+  const picked = selection.has(page.id);
+  const star = page.is_pinned ? '<span class="pin-mark">★</span>' : '';
+
+  if (view === 'list') {
+    return `
+      <button type="button" class="card row tile-row${picked ? ' picked' : ''}" data-tile="${esc(page.id)}">
+        <span class="thumb-sm">${cover
+          ? `<img src="${esc(cover)}" alt="" loading="lazy">`
+          : `<span class="thumb-ph tinted" style="${tintStyle(title)}">${initial}</span>`}${picked ? '<span class="pick-dot">✓</span>' : ''}</span>
+        <span class="grow">
+          <span class="t">${esc(title)}${star}</span>
+          ${text ? `<span class="p">${esc(text.slice(0, 90))}</span>` : '<span class="p vide">Page vide</span>'}
+          <span class="d">${esc(space?.name || 'Inbox')} · ${fmt(page.updated_at)}</span>
+        </span>
+      </button>`;
+  }
+
+  return `
+    <button type="button" class="tile${picked ? ' picked' : ''}" data-tile="${esc(page.id)}">
+      <span class="tile-img">${cover
+        ? `<img src="${esc(cover)}" alt="" loading="lazy">`
+        : `<span class="tile-ph tinted" style="${tintStyle(title)}">${initial}</span>`}${picked ? '<span class="pick-dot">✓</span>' : ''}${star}</span>
+      <span class="tile-body">
+        <span class="tile-t">${esc(title)}</span>
+        <span class="tile-m">${esc(space?.name || 'Inbox')} · ${fmt(page.updated_at)}</span>
+      </span>
+    </button>`;
+}
+
+/* Appui long : Android déclenche sinon la sélection de texte et son
+   propre menu contextuel. On tolère 10 px de glissement du doigt. */
+function bindLongPress(element, onLong, delay = 450) {
+  let timer = null;
+  let fired = false;
+  let startX = 0;
+  let startY = 0;
+
+  const cancel = () => {
+    clearTimeout(timer);
+    timer = null;
+  };
+
+  element.addEventListener('pointerdown', event => {
+    startX = event.clientX;
+    startY = event.clientY;
+    fired = false;
+    timer = setTimeout(() => {
+      fired = true;
+      if (navigator.vibrate) navigator.vibrate(12);
+      onLong();
+    }, delay);
+  });
+
+  element.addEventListener('pointermove', event => {
+    if (Math.hypot(event.clientX - startX, event.clientY - startY) > 10) cancel();
+  });
+
+  ['pointerup', 'pointercancel', 'pointerleave'].forEach(name =>
+    element.addEventListener(name, cancel));
+
+  element.addEventListener('click', event => {
+    if (fired) {
+      event.preventDefault();
+      event.stopPropagation();
+      fired = false;
+    }
+  }, true);
+
+  element.addEventListener('contextmenu', event => event.preventDefault());
+}
+
+function selectionHeader() {
+  const n = selection.size;
+  return `
+    <header class="top global top-select">
+      <button type="button" class="icon-btn" id="selCancel" aria-label="Quitter la sélection">✕</button>
+      <div class="title">${n} ${plural(n, 'sélectionnée')}</div>
+      <div class="header-actions">
+        <button type="button" class="icon-btn" id="selAll" aria-label="Tout sélectionner">☑</button>
+        <button type="button" class="icon-btn" id="selMore" aria-label="Actions groupées">⋮</button>
+      </div>
+    </header>
+  `;
+}
+
+function libraryScope(param) {
+  const raw = param || 'all';
+  if (raw.startsWith('space:')) {
+    const space = getSpace(raw.slice(6));
+    return space
+      ? { kind: 'space', id: space.id, title: space.name, where: 'space_id = ?', params: [space.id] }
+      : { kind: 'all', title: 'Toutes les pages', where: '1=1', params: [] };
+  }
+  if (raw.startsWith('cat:')) {
+    const category = getCategory(raw.slice(4));
+    return category
+      ? {
+          kind: 'cat',
+          id: category.id,
+          spaceId: category.space_id,
+          title: category.name,
+          where: 'id IN (SELECT page_id FROM page_categories WHERE category_id = ?)',
+          params: [category.id]
+        }
+      : { kind: 'all', title: 'Toutes les pages', where: '1=1', params: [] };
+  }
+  if (raw === 'pinned') {
+    return { kind: 'pinned', title: 'Épinglées', where: 'is_pinned = 1', params: [] };
+  }
+  if (raw === 'inbox') {
+    return { kind: 'inbox', title: 'Inbox', where: 'space_id IS NULL', params: [] };
+  }
+  return { kind: 'all', title: 'Toutes les pages', where: '1=1', params: [] };
+}
+
+function screenLibrary(param) {
+  const scope = libraryScope(param);
+  const space = scope.kind === 'space' ? getSpace(scope.id)
+    : scope.kind === 'cat' ? getSpace(scope.spaceId)
+    : null;
+  let filter = '';
+
+  const fetchRows = () => {
+    const clauses = ['deleted_at IS NULL', scope.where];
+    const params = [...scope.params];
+    if (filter) {
+      clauses.push('search_text LIKE ?');
+      params.push(`%${normalize(filter)}%`);
+    }
+    return q(`
+      SELECT id,title,body,cover,space_id,created_at,updated_at,is_pinned,search_text
+      FROM pages WHERE ${clauses.join(' AND ')}
+      ORDER BY is_pinned DESC, ${sortClause()}
+    `, params);
+  };
+
+  function paint() {
+    const pages = fetchRows();
+    const selecting = selection.size > 0;
+
+    app.innerHTML = `
+      ${selecting ? selectionHeader() : wrapHeader(space, null, globalHeader(scope.title))}
+      <main>
+        <form class="lib-search" id="libSearchForm">
+          <label class="sr-only" for="libSearch">Filtrer</label>
+          <input class="search-input" id="libSearch" type="search" placeholder="Filtrer dans ${esc(scope.title)}…" value="${esc(filter)}">
+        </form>
+        <div class="sort-row">
+          <button type="button" class="sort-label" id="sortBtn">${esc(sortLabel())} <span aria-hidden="true">⌄</span></button>
+          <button type="button" class="sort-dir" id="sortDir" aria-label="${sortDesc ? 'Ordre décroissant' : 'Ordre croissant'}">${sortDesc ? '↓' : '↑'}</button>
+          <span class="sort-count">${pages.length}</span>
+          <button type="button" class="icon-btn" id="viewToggle" aria-label="Changer d'affichage">${listView === 'grid' ? '▤' : '▦'}</button>
+        </div>
+        ${pages.length
+          ? (listView === 'grid'
+              ? `<div class="tile-grid">${pages.map(page => pageTile(page, 'grid')).join('')}</div>`
+              : pages.map(page => pageTile(page, 'list')).join(''))
+          : `<div class="empty">${filter ? 'Aucune page ne correspond au filtre.' : 'Aucune page ici.'}</div>`}
+      </main>
+      ${selecting || scope.kind === 'pinned' ? '' : '<button type="button" class="fab" id="libFab" aria-label="Nouvelle page">+</button>'}
+    `;
+
+    if (selecting) {
+      document.getElementById('selCancel').onclick = () => {
+        selection.clear();
+        paint();
+      };
+      document.getElementById('selAll').onclick = () => {
+        const all = pages.every(page => selection.has(page.id));
+        pages.forEach(page => all ? selection.delete(page.id) : selection.add(page.id));
+        paint();
+      };
+      document.getElementById('selMore').onclick = event =>
+        openSelectionMenu(event.currentTarget, paint);
+    } else {
+      bindGlobal();
+    }
+
+    const input = document.getElementById('libSearch');
+    let timer = null;
+    input.oninput = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        filter = input.value.trim();
+        const caret = input.selectionStart;
+        paint();
+        const next = document.getElementById('libSearch');
+        next.focus();
+        next.setSelectionRange(caret, caret);
+      }, 220);
+    };
+    document.getElementById('libSearchForm').onsubmit = event => {
+      event.preventDefault();
+      input.blur();
+    };
+
+    document.getElementById('libFab')?.addEventListener('click', () => {
+      if (scope.kind === 'space') return quickNote(scope.id);
+      if (scope.kind === 'cat') return quickNote(scope.spaceId, scope.id);
+      quickNote(null);
+    });
+
+    document.getElementById('sortBtn').onclick = () => openSortDialog(paint);
+    document.getElementById('sortDir').onclick = () => {
+      sortDesc = !sortDesc;
+      localStorage.setItem('wiki-sort-desc', sortDesc ? '1' : '0');
+      paint();
+    };
+    document.getElementById('viewToggle').onclick = () => {
+      listView = listView === 'grid' ? 'list' : 'grid';
+      localStorage.setItem('wiki-view', listView);
+      paint();
+    };
+
+    app.querySelectorAll('[data-tile]').forEach(element => {
+      const id = element.dataset.tile;
+      element.onclick = () => {
+        if (selection.size > 0) {
+          selection.has(id) ? selection.delete(id) : selection.add(id);
+          paint();
+        } else {
+          go('read', id);
+        }
+      };
+      bindLongPress(element, () => {
+        selection.add(id);
+        paint();
+      });
+    });
+  }
+
+  paint();
+}
+
+function openSortDialog(after) {
+  openDialog('Trier par', `
+    <div class="picker-list">
+      ${Object.entries(SORTS).map(([key, item]) =>
+        `<button type="button" class="picker-item${key === currentSort ? ' current' : ''}" data-sort="${key}">${esc(item.label)}</button>`
+      ).join('')}
+    </div>
+    <div class="sort-dir-row">
+      <button type="button" class="scope-chip" data-dir="desc" aria-pressed="${sortDesc}">↓ Décroissant</button>
+      <button type="button" class="scope-chip" data-dir="asc" aria-pressed="${!sortDesc}">↑ Croissant</button>
+    </div>
+  `, dialog => {
+    dialog.querySelectorAll('[data-sort]').forEach(button => {
+      button.onclick = () => {
+        currentSort = button.dataset.sort;
+        localStorage.setItem('wiki-sort', currentSort);
+        dialog.remove();
+        after();
+      };
+    });
+    dialog.querySelectorAll('[data-dir]').forEach(button => {
+      button.onclick = () => {
+        sortDesc = button.dataset.dir === 'desc';
+        localStorage.setItem('wiki-sort-desc', sortDesc ? '1' : '0');
+        dialog.querySelectorAll('[data-dir]').forEach(item =>
+          item.setAttribute('aria-pressed', String(item === button)));
+        after();
+      };
+    });
+  });
+}
+
+function openSelectionMenu(anchor, after) {
+  const ids = [...selection];
+  const anyUnpinned = ids.some(id => !getPage(id)?.is_pinned);
+
+  buildMenu(anchor, [
+    {
+      label: anyUnpinned ? 'Épingler' : 'Désépingler',
+      run: async () => {
+        transaction(() => ids.forEach(id =>
+          run('UPDATE pages SET is_pinned = ? WHERE id = ?', [anyUnpinned ? 1 : 0, id])));
+        await saveDB();
+        selection.clear();
+        after();
+        toast(anyUnpinned ? 'Pages épinglées.' : 'Pages désépinglées.');
+      }
+    },
+    { label: 'Déplacer vers…', run: () => moveDialog(ids, after) },
+    { label: 'Relier à une catégorie…', run: () => linkCategoryDialog(ids, after) },
+    {
+      label: `Mettre à la corbeille (${ids.length})`,
+      danger: true,
+      run: async () => {
+        const now = Date.now();
+        transaction(() => ids.forEach(id =>
+          run('UPDATE pages SET deleted_at = ? WHERE id = ?', [now, id])));
+        await saveDB();
+        selection.clear();
+        after();
+        toast(`${ids.length} ${plural(ids.length, 'page')} à la corbeille`, false, {
+          label: 'Annuler',
+          run: async () => {
+            transaction(() => ids.forEach(id =>
+              run('UPDATE pages SET deleted_at = NULL WHERE id = ?', [id])));
+            await saveDB();
+            render();
+            toast('Pages restaurées.');
+          }
+        });
+      }
+    }
+  ]);
+}
+
+/* Changer de projet vide les catégories : elles appartiennent à
+   l'ancien projet et n'ont plus de sens ailleurs. */
+function moveDialog(pageIds, after) {
+  const spaces = q('SELECT id,name FROM spaces ORDER BY name COLLATE NOCASE');
+  openDialog(`Déplacer ${pageIds.length} ${plural(pageIds.length, 'page')}`, `
+    <div class="picker-list">
+      <button type="button" class="picker-item" data-move="">📥 Inbox</button>
+      ${spaces.map(item => `<button type="button" class="picker-item" data-move="${esc(item.id)}">${esc(item.name)}</button>`).join('')}
+    </div>
+  `, dialog => {
+    dialog.querySelectorAll('[data-move]').forEach(button => {
+      button.onclick = async () => {
+        const target = button.dataset.move || null;
+        const now = Date.now();
+        transaction(() => {
+          pageIds.forEach(id => {
+            run('UPDATE pages SET space_id = ?, is_inbox = ?, updated_at = ? WHERE id = ?',
+              [target, target ? 0 : 1, now, id]);
+            run('DELETE FROM page_categories WHERE page_id = ?', [id]);
+          });
+        });
+        await saveDB();
+        dialog.remove();
+        selection.clear();
+        after ? after() : render();
+        toast(target ? 'Pages déplacées.' : 'Pages renvoyées dans l\'Inbox.');
+      };
+    });
+  });
+}
+
+function linkCategoryDialog(pageIds, after) {
+  const spaceIds = new Set(pageIds.map(id => getPage(id)?.space_id || null));
+  if (spaceIds.size > 1) {
+    return toast('Sélectionne des pages d\'un même projet.', true);
+  }
+  const spaceId = [...spaceIds][0];
+  if (!spaceId) return toast('Ces pages sont dans l\'Inbox : déplace-les d\'abord.', true);
+
+  const categories = getSpaceCategories(spaceId);
+  if (!categories.length) return toast('Ce projet n\'a pas encore de catégorie.', true);
+
+  openDialog('Relier à une catégorie', `
+    <div class="picker-list">
+      ${categories.map(item => `<button type="button" class="picker-item" data-link="${esc(item.id)}">${esc(item.name)}</button>`).join('')}
+    </div>
+  `, dialog => {
+    dialog.querySelectorAll('[data-link]').forEach(button => {
+      button.onclick = async () => {
+        transaction(() => pageIds.forEach(id =>
+          run('INSERT OR IGNORE INTO page_categories (page_id,category_id) VALUES (?,?)',
+            [id, button.dataset.link])));
+        await saveDB();
+        dialog.remove();
+        selection.clear();
+        after ? after() : render();
+        toast('Pages reliées.');
+      };
+    });
+  });
+}
+
+/* ============================================================
+   Recherche
+   ============================================================ */
+
+const escapeRegex = value => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/* « foo bar » = les deux mots requis. « -mot » exclut. « "mot" » force
+   la correspondance sur le mot entier. */
+function parseQuery(raw) {
+  const tokens = [];
+  const pattern = /-?"[^"]+"|-?\S+/g;
+  let match;
+
+  while ((match = pattern.exec(raw)) !== null) {
+    let piece = match[0];
+    const negated = piece.startsWith('-');
+    if (negated) piece = piece.slice(1);
+    const exact = piece.startsWith('"') && piece.endsWith('"');
+    if (exact) piece = piece.slice(1, -1);
+    const value = normalize(piece);
+    if (value) tokens.push({ value, negated, exact });
+  }
+  return tokens;
+}
+
+function searchPages(tokens, spaceId = null) {
+  const positives = tokens.filter(token => !token.negated);
+  if (!positives.length) return [];
+
+  const clauses = ['deleted_at IS NULL', ...positives.map(() => 'search_text LIKE ?')];
+  const params = positives.map(token => `%${token.value}%`);
+  if (spaceId) {
+    clauses.push('space_id = ?');
+    params.push(spaceId);
+  }
+
+  return q(`
+    SELECT id,title,body,space_id,updated_at,is_pinned,search_text
+    FROM pages WHERE ${clauses.join(' AND ')}
+  `, params).filter(page => tokens.every(token => {
+    const hay = page.search_text || '';
+    const found = token.exact
+      ? new RegExp(`(^|[^a-z0-9])${escapeRegex(token.value)}([^a-z0-9]|$)`).test(hay)
+      : hay.includes(token.value);
+    return token.negated ? !found : found;
+  }));
+}
+
+function relevance(page, tokens) {
+  const title = normalize(displayTitle(page.title));
+  let score = 0;
+  tokens.filter(token => !token.negated).forEach(token => {
+    if (title === token.value) score += 100;
+    else if (title.startsWith(token.value)) score += 50;
+    else if (title.includes(token.value)) score += 25;
+  });
+  if (page.is_pinned) score += 10;
+  return score;
+}
+
+/* Extrait pris AUTOUR du mot trouvé, pas au début du texte :
+   sur une page longue, l'occurrence est souvent loin du début. */
+function snippet(text, tokens, radius = 70) {
+  const plain = String(text || '').normalize('NFC');
+  const hay = normalize(plain);
+  const hit = tokens
+    .filter(token => !token.negated)
+    .map(token => hay.indexOf(token.value))
+    .filter(index => index >= 0)
+    .sort((a, b) => a - b)[0];
+
+  if (hit === undefined) return plain.slice(0, 160);
+
+  const start = Math.max(0, hit - radius);
+  const end = Math.min(plain.length, hit + radius * 2);
+  return (start > 0 ? '… ' : '') + plain.slice(start, end).trim() + (end < plain.length ? ' …' : '');
+}
+
+/* Les positions sont calculées sur le texte normalisé puis appliquées au
+   texte d'origine : en NFC puis NFD, retirer les accents conserve
+   l'alignement. Tout est échappé, seul <mark> est injecté. */
+function highlight(text, tokens) {
+  const plain = String(text || '').normalize('NFC');
+  const hay = normalize(plain);
+  const values = tokens.filter(token => !token.negated).map(token => token.value);
+
+  const ranges = [];
+  values.forEach(value => {
+    let from = 0;
+    let at;
+    while ((at = hay.indexOf(value, from)) !== -1) {
+      ranges.push([at, at + value.length]);
+      from = at + value.length;
+    }
+  });
+  if (!ranges.length) return esc(plain);
+
+  ranges.sort((a, b) => a[0] - b[0]);
+  const merged = [ranges[0]];
+  ranges.slice(1).forEach(range => {
+    const last = merged[merged.length - 1];
+    if (range[0] <= last[1]) last[1] = Math.max(last[1], range[1]);
+    else merged.push(range);
+  });
+
+  let out = '';
+  let cursor = 0;
+  merged.forEach(([start, end]) => {
+    out += esc(plain.slice(cursor, start)) + '<mark>' + esc(plain.slice(start, end)) + '</mark>';
+    cursor = end;
+  });
+  return out + esc(plain.slice(cursor));
+}
+
+function resultCard(page, tokens) {
+  const space = spaceOf(page.space_id);
+  const text = strip(page.body);
+  const cover = safeImage(page.cover);
+  const title = displayTitle(page.title);
+  return `
+    <button type="button" class="result" data-page="${esc(page.id)}">
+      <span class="result-thumb">${cover
+        ? `<img src="${esc(cover)}" alt="" loading="lazy">`
+        : `<span class="thumb-ph tinted" style="${tintStyle(title)}">${esc(title[0] || '?')}</span>`}</span>
+      <span class="result-main">
+        <span class="result-t">${highlight(title, tokens)}</span>
+        ${text
+          ? `<span class="result-s">${highlight(snippet(text, tokens), tokens)}</span>`
+          : '<span class="result-s vide">Page vide</span>'}
+        <span class="result-m">${esc(space?.name || 'Inbox')} · ${fmt(page.updated_at)}</span>
+      </span>
+    </button>
+  `;
 }
 
 function screenSearch() {
-  let timer = null;
-  app.innerHTML = `${globalHeader('Recherche')}<main><form class="search-row" id="searchForm"><label class="sr-only" for="searchInput">Rechercher</label><input class="search-input" id="searchInput" type="search" placeholder="Rechercher dans le wiki..."><button class="btn-accent" type="submit">OK</button></form><div id="results"><div class="empty">Tape un mot : titres et textes sont fouillés.</div></div></main>`;
+  const scopeSpace = currentSpace();
+  /* La portée choisie est retenue d'une recherche à l'autre. */
+  let scope = scopeSpace ? (localStorage.getItem('wiki-search-scope') || 'all') : 'all';
+
+  app.innerHTML = `
+    ${globalHeader('Recherche')}
+    <main>
+      <form class="search-row" id="searchForm">
+        <label class="sr-only" for="searchInput">Rechercher</label>
+        <input class="search-input" id="searchInput" type="search" enterkeyhint="search" placeholder="Rechercher dans le wiki...">
+        <button class="btn-accent" type="submit">OK</button>
+      </form>
+      ${scopeSpace ? `
+        <div class="search-scope">
+          <button type="button" class="scope-chip" data-scope="all" aria-pressed="${scope === 'all'}">Tous les projets</button>
+          <button type="button" class="scope-chip" data-scope="space" aria-pressed="${scope === 'space'}">${esc(scopeSpace.name)}</button>
+        </div>` : ''}
+      <div class="search-help">Plusieurs mots : tous requis. <b>-mot</b> exclut. <b>"mot"</b> cherche le mot entier.</div>
+      <div id="results"></div>
+    </main>
+  `;
+
   bindGlobal();
 
   const input = document.getElementById('searchInput');
   const results = document.getElementById('results');
-  const draw = () => {
-    const query = input.value.trim();
-    if (!query) {
-      results.innerHTML = '<div class="empty">Tape un mot : titres et textes sont fouillés.</div>';
+  let timer = null;
+
+  /* Pendant la frappe : suggestions sur les titres uniquement (requête légère).
+     À la validation : recherche plein texte avec extraits. */
+  function suggest() {
+    const value = input.value.trim();
+    if (!value) {
+      results.innerHTML = '';
       return;
     }
-    const needle = normalize(query);
-    const pages = q('SELECT id,title,body,updated_at,is_pinned FROM pages ORDER BY updated_at DESC')
-      .filter(page => normalize(`${page.title} ${strip(page.body)}`).includes(needle))
-      .slice(0, 50);
-    results.innerHTML = pages.map(pageCard).join('') || `<div class="empty">Aucun résultat pour « ${esc(query)} ».</div>`;
+    const rows = q(`
+      SELECT id,title FROM pages
+      WHERE search_text LIKE ? AND deleted_at IS NULL
+      ORDER BY updated_at DESC LIMIT 6
+    `, [`%${normalize(value)}%`]);
+
+    results.innerHTML = rows.length
+      ? `<div class="suggest-list">${rows.map(page =>
+          `<button type="button" class="suggest-item" data-page="${esc(page.id)}">${esc(displayTitle(page.title))}</button>`
+        ).join('')}</div>`
+      : '';
     wirePages(results);
-  };
+  }
+
+  function draw() {
+    const raw = input.value.trim();
+    if (!raw) {
+      results.innerHTML = '<div class="empty">Tape un mot, puis valide.</div>';
+      return;
+    }
+
+    const tokens = parseQuery(raw);
+    const spaceId = scope === 'space' && scopeSpace ? scopeSpace.id : null;
+    const rows = searchPages(tokens, spaceId)
+      .sort((a, b) => relevance(b, tokens) - relevance(a, tokens) || b.updated_at - a.updated_at)
+      .slice(0, 60);
+
+    results.innerHTML = `
+      <button type="button" class="create-banner" id="createFromSearch">
+        Créer la page <b>« ${esc(raw)} »</b> — ou consulte les résultats ci-dessous.
+      </button>
+      <div class="search-count">${rows.length} ${plural(rows.length, 'résultat')} pour « ${esc(raw)} »</div>
+      ${rows.map(page => resultCard(page, tokens)).join('') || '<div class="empty">Aucune page ne correspond.</div>'}
+    `;
+
+    document.getElementById('createFromSearch').onclick = () => {
+      const targetSpace = scope === 'space' && scopeSpace ? scopeSpace.id : null;
+      quickNote(targetSpace, null, raw);
+    };
+    wirePages(results);
+  }
+
+  app.querySelectorAll('[data-scope]').forEach(button => {
+    button.onclick = () => {
+      scope = button.dataset.scope;
+      localStorage.setItem('wiki-search-scope', scope);
+      app.querySelectorAll('[data-scope]').forEach(item =>
+        item.setAttribute('aria-pressed', String(item === button)));
+      if (input.value.trim()) draw();
+    };
+  });
 
   input.oninput = () => {
     clearTimeout(timer);
-    timer = setTimeout(draw, 180);
+    timer = setTimeout(suggest, 160);
   };
+
   document.getElementById('searchForm').onsubmit = event => {
     event.preventDefault();
+    clearTimeout(timer);
+    input.blur();
     draw();
   };
+
+  results.innerHTML = '<div class="empty">Tape un mot, puis valide.</div>';
   input.focus();
 }
+
+/* ============================================================
+   Éditeur
+   ============================================================ */
 
 const Wikilink = Node.create({
   name: 'wikilink',
@@ -920,12 +1886,16 @@ function toolbar() {
   return `
     <div class="toolbar" role="toolbar" aria-label="Mise en forme">
       <button type="button" class="tb" data-command="bold" aria-label="Gras" aria-pressed="false">B</button>
-      <button type="button" class="tb" data-command="italic" aria-label="Italique" aria-pressed="false">I</button>
+      <button type="button" class="tb" data-command="italic" aria-label="Italique" aria-pressed="false"><em>I</em></button>
+      <button type="button" class="tb" data-command="strike" aria-label="Barré" aria-pressed="false"><s>S</s></button>
       <button type="button" class="tb" data-command="h2" aria-label="Titre 2" aria-pressed="false">H2</button>
       <button type="button" class="tb" data-command="h3" aria-label="Titre 3" aria-pressed="false">H3</button>
-      <button type="button" class="tb" data-command="bullet" aria-label="Liste" aria-pressed="false">•</button>
-      <button type="button" class="tb" data-command="quote" aria-label="Citation" aria-pressed="false">Q</button>
-      <button type="button" class="tb" data-command="link" aria-label="Lien wiki">Link</button>
+      <button type="button" class="tb" data-command="bullet" aria-label="Liste à puces" aria-pressed="false">•</button>
+      <button type="button" class="tb" data-command="ordered" aria-label="Liste numérotée" aria-pressed="false">1.</button>
+      <button type="button" class="tb" data-command="quote" aria-label="Citation" aria-pressed="false">❝</button>
+      <button type="button" class="tb" data-command="code" aria-label="Code" aria-pressed="false">&lt;/&gt;</button>
+      <button type="button" class="tb" data-command="rule" aria-label="Séparateur">―</button>
+      <button type="button" class="tb" data-command="link" aria-label="Lien wiki">🔗</button>
     </div>
   `;
 }
@@ -933,65 +1903,132 @@ function toolbar() {
 function screenEdit(id) {
   const page = getPage(id);
   if (!page) return goHome();
+  if (page.deleted_at) {
+    toast('Restaure la page avant de la modifier.', true);
+    return replaceCurrent('read', id);
+  }
   const space = page.space_id ? getSpace(page.space_id) : null;
-  const categories = space ? getSpaceCategories(space.id) : [];
-  const selected = new Set(getPageCategories(id).map(category => category.id));
 
+  /* Écran d'écriture : plus de barre de contexte, plus de sélecteur de
+     couverture ni de chips en haut. Tout est passé dans la feuille
+     « Réglages », ce qui rend l'espace de frappe à la page. */
   app.innerHTML = `
-    ${wrapHeader(space, page, globalHeader('Édition'))}
-    <main>
-      <label class="sr-only" for="pageTitle">Titre</label><input class="title-input" id="pageTitle" maxlength="160" placeholder="Titre" value="${esc(page.title || '')}">
-      <div class="cover-picker"><button type="button" class="cover-preview" id="coverPreview">Ajouter une image de couverture</button><div class="cover-actions"><button type="button" class="btn-ghost" id="coverBtn">Choisir une image</button><button type="button" class="btn-ghost" id="clearCover">Retirer</button></div></div>
-      ${categories.length ? `<div class="lab">Catégories</div><div class="category-chips">${categories.map(category => `<button type="button" class="category-chip" data-category-choice="${esc(category.id)}" aria-pressed="${selected.has(category.id)}">${esc(category.name)}</button>`).join('')}</div>` : ''}
+    <header class="top global edit-top">
+      <button type="button" class="icon-btn" id="editBack" aria-label="Retour">‹</button>
+      <div class="title">Édition</div>
+      <div class="header-actions">
+        <button type="button" class="icon-btn" id="editSettings" aria-label="Réglages de la page">⋮</button>
+        <button type="button" class="btn-accent edit-save" id="savePage">OK</button>
+      </div>
+    </header>
+    <main class="edit-main">
+      <label class="sr-only" for="pageTitle">Titre</label>
+      <input class="title-input" id="pageTitle" maxlength="160" placeholder="Titre" value="${esc(page.title || '')}">
       <div class="editor-wrap"><div id="editor"></div></div>
     </main>
     ${toolbar()}
-    <button type="button" class="btn-accent save-page" id="savePage">Enregistrer</button>
+    <div class="autosave" id="autosaveFlag">Enregistré</div>
   `;
 
-  bindGlobal();
   let cover = safeImage(page.cover) || null;
-  const preview = document.getElementById('coverPreview');
-  const refreshCover = () => {
-    preview.style.backgroundImage = cover ? `url("${cover.replace(/"/g, '%22')}")` : '';
-    preview.textContent = cover ? '' : 'Ajouter une image de couverture';
-  };
-  refreshCover();
-  document.getElementById('coverBtn').onclick = async () => {
-    const image = await pickImage();
-    if (image) {
-      cover = image;
-      refreshCover();
-    }
-  };
-  preview.onclick = document.getElementById('coverBtn').onclick;
-  document.getElementById('clearCover').onclick = () => {
-    cover = null;
-    refreshCover();
-  };
-  app.querySelectorAll('[data-category-choice]').forEach(button => {
-    button.onclick = () => button.setAttribute('aria-pressed', String(button.getAttribute('aria-pressed') !== 'true'));
-  });
+  let categoryIds = new Set(getPageCategories(id).map(category => category.id));
+
+  document.getElementById('editBack').onclick = () => back();
 
   editor = new Editor({
     element: document.getElementById('editor'),
     content: sanitizeHTML(page.body || ''),
     extensions: [StarterKit.configure({ heading: { levels: [2, 3, 4] } }), Wikilink, WikiRule],
-    onUpdate: updateToolbar,
+    autofocus: 'end',
+    onUpdate: () => { updateToolbar(); touch(); },
     onSelectionUpdate: updateToolbar
   });
+
+  /* Le clavier ne s'ouvre que si le focus part du geste utilisateur :
+     surtout ne rien attendre entre le clic « Modifier » et cet appel. */
+  editor.commands.focus('end');
+
+  /* ---- Sauvegarde automatique ----
+     Chrome Android peut tuer l'onglet en arrière-plan sans prévenir :
+     on écrit après 900 ms d'inactivité, systématiquement quand la page
+     passe en arrière-plan, et impérativement avant de quitter l'écran. */
+  let dirty = false;
+  let saveTimer = null;
+  const flag = document.getElementById('autosaveFlag');
+
+  function showFlag(text) {
+    flag.textContent = text;
+    flag.classList.add('show');
+    setTimeout(() => flag.classList.remove('show'), 1400);
+  }
+
+  function collect() {
+    return {
+      title: document.getElementById('pageTitle')?.value.trim() ?? page.title ?? '',
+      body: editor && !editor.isDestroyed ? sanitizeHTML(editor.getHTML()) : page.body
+    };
+  }
+
+  function writeDraft() {
+    if (!dirty) return false;
+    const { title, body } = collect();
+    dirty = false;
+    run('UPDATE pages SET title = ?, body = ?, search_text = ?, updated_at = ? WHERE id = ?', [
+      title, body, buildSearchText(title, body, page.infobox), Date.now(), id
+    ]);
+    return true;
+  }
+
+  async function persistDraft() {
+    if (!writeDraft()) return;
+    await saveDB();
+    showFlag('Enregistré');
+  }
+
+  function touch() {
+    dirty = true;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      persistDraft().catch(error => toast(`Sauvegarde impossible : ${error.message}`, true));
+    }, 900);
+  }
+
+  document.getElementById('pageTitle').addEventListener('input', touch);
+
+  /* Appelé par cleanup() juste avant editor.destroy() : l'écriture SQL
+     est synchrone, donc rien ne peut se perdre en quittant l'écran. */
+  editorFlushNow = () => {
+    clearTimeout(saveTimer);
+    if (writeDraft()) saveDB();
+  };
+
+  editorFlush = () => {
+    if (document.visibilityState === 'hidden') {
+      clearTimeout(saveTimer);
+      persistDraft().catch(() => {});
+    }
+  };
+  document.addEventListener('visibilitychange', editorFlush);
+  window.addEventListener('pagehide', editorFlush);
 
   const commands = {
     bold: () => editor.chain().focus().toggleBold().run(),
     italic: () => editor.chain().focus().toggleItalic().run(),
+    strike: () => editor.chain().focus().toggleStrike().run(),
     h2: () => editor.chain().focus().toggleHeading({ level: 2 }).run(),
     h3: () => editor.chain().focus().toggleHeading({ level: 3 }).run(),
     bullet: () => editor.chain().focus().toggleBulletList().run(),
+    ordered: () => editor.chain().focus().toggleOrderedList().run(),
     quote: () => editor.chain().focus().toggleBlockquote().run(),
+    code: () => editor.chain().focus().toggleCode().run(),
+    rule: () => editor.chain().focus().setHorizontalRule().run(),
     link: () => openPicker(insertWikilink)
   };
 
   app.querySelectorAll('[data-command]').forEach(button => {
+    /* pointerdown + preventDefault : le champ ne perd pas le focus,
+       donc le clavier ne se referme pas entre deux mises en forme. */
+    button.addEventListener('pointerdown', event => event.preventDefault());
     button.onclick = () => {
       commands[button.dataset.command]?.();
       updateToolbar();
@@ -999,49 +2036,129 @@ function screenEdit(id) {
   });
 
   function updateToolbar() {
-    if (!editor) return;
+    if (!editor || editor.isDestroyed) return;
     const states = {
       bold: editor.isActive('bold'),
       italic: editor.isActive('italic'),
+      strike: editor.isActive('strike'),
       h2: editor.isActive('heading', { level: 2 }),
       h3: editor.isActive('heading', { level: 3 }),
       bullet: editor.isActive('bulletList'),
-      quote: editor.isActive('blockquote')
+      ordered: editor.isActive('orderedList'),
+      quote: editor.isActive('blockquote'),
+      code: editor.isActive('code')
     };
     app.querySelectorAll('[data-command]').forEach(button => {
       const active = Boolean(states[button.dataset.command]);
       button.classList.toggle('on', active);
-      if (button.dataset.command !== 'link') button.setAttribute('aria-pressed', String(active));
+      if (!['link', 'rule'].includes(button.dataset.command)) {
+        button.setAttribute('aria-pressed', String(active));
+      }
     });
+  }
+
+  /* Réglages de la page : couverture, catégories, fiche, galerie.
+     Tout ce qui n'est pas de la frappe sort du chemin. */
+  document.getElementById('editSettings').onclick = () => {
+    const categories = space ? getSpaceCategories(space.id) : [];
+    openDialog('Réglages de la page', `
+      <div class="ib-image-setting">
+        <span class="lab">Image de couverture</span>
+        <button type="button" class="project-image-preview project-image-preview--banner" id="coverPreview" aria-label="Choisir une couverture"></button>
+        <div class="project-image-actions">
+          <button type="button" class="btn-ghost" id="coverBtn">Choisir</button>
+          <button type="button" class="btn-ghost danger-text" id="clearCover">Retirer</button>
+        </div>
+      </div>
+      ${categories.length ? `
+        <div class="lab">Catégories</div>
+        <div class="category-chips category-chips--wrap">
+          ${categories.map(category => `<button type="button" class="category-chip" data-category-choice="${esc(category.id)}" aria-pressed="${categoryIds.has(category.id)}">${esc(category.name)}</button>`).join('')}
+        </div>` : '<p class="theme-help">Ce projet n’a pas encore de catégorie.</p>'}
+      <div class="picker-list">
+        <button type="button" class="picker-item" id="editIbHere">🗂 Fiche d’information</button>
+        <button type="button" class="picker-item" id="editGalHere">🖼 Galerie de la page</button>
+      </div>
+      <button type="button" class="btn-accent quick" data-close-settings>Terminé</button>
+    `, dialog => {
+      const preview = dialog.querySelector('#coverPreview');
+      const refreshCover = () => {
+        preview.style.backgroundImage = cover ? `url("${cover.replace(/"/g, '%22')}")` : '';
+        preview.textContent = cover ? '' : 'Aucune couverture';
+        preview.classList.toggle('is-empty', !cover);
+      };
+      refreshCover();
+
+      dialog.querySelector('#coverBtn').onclick = async () => {
+        const image = await pickImage();
+        if (image) {
+          cover = image;
+          dirty = true;
+          refreshCover();
+        }
+      };
+      preview.onclick = dialog.querySelector('#coverBtn').onclick;
+      dialog.querySelector('#clearCover').onclick = () => {
+        cover = null;
+        dirty = true;
+        refreshCover();
+      };
+
+      dialog.querySelectorAll('[data-category-choice]').forEach(button => {
+        button.onclick = () => {
+          const value = button.dataset.categoryChoice;
+          const next = button.getAttribute('aria-pressed') !== 'true';
+          button.setAttribute('aria-pressed', String(next));
+          next ? categoryIds.add(value) : categoryIds.delete(value);
+        };
+      });
+
+      dialog.querySelector('#editIbHere').onclick = () => {
+        dialog.remove();
+        editInfobox(id);
+      };
+      dialog.querySelector('#editGalHere').onclick = async () => {
+        dialog.remove();
+        await saveAll(false);
+        go('gallery', id);
+      };
+      dialog.querySelector('[data-close-settings]').onclick = () => dialog.remove();
+    });
+  };
+
+  async function saveAll(navigate = true) {
+    clearTimeout(saveTimer);
+    const now = Date.now();
+    const { title, body } = collect();
+
+    transaction(() => {
+      run('UPDATE pages SET title=?,body=?,search_text=?,cover=?,updated_at=?,is_inbox=? WHERE id=?', [
+        title,
+        body,
+        buildSearchText(title, body, page.infobox),
+        cover,
+        now,
+        page.space_id ? 0 : 1,
+        id
+      ]);
+      run('DELETE FROM page_categories WHERE page_id=?', [id]);
+      [...categoryIds].forEach(categoryId => {
+        if (getCategory(categoryId)?.space_id === page.space_id) {
+          run('INSERT INTO page_categories (page_id,category_id) VALUES (?,?)', [id, categoryId]);
+        }
+      });
+    });
+
+    dirty = false;
+    await saveDB();
+    if (navigate) replaceCurrent('read', id);
   }
 
   document.getElementById('savePage').onclick = async event => {
     const button = event.currentTarget;
     button.disabled = true;
     try {
-      const now = Date.now();
-      const categoryIds = [...app.querySelectorAll('[data-category-choice][aria-pressed="true"]')]
-        .map(item => item.dataset.categoryChoice);
-
-      transaction(() => {
-        run('UPDATE pages SET title=?,body=?,cover=?,updated_at=?,is_inbox=? WHERE id=?', [
-          document.getElementById('pageTitle').value.trim(),
-          sanitizeHTML(editor.getHTML()),
-          cover,
-          now,
-          page.space_id ? 0 : 1,
-          id
-        ]);
-        run('DELETE FROM page_categories WHERE page_id=?', [id]);
-        categoryIds.forEach(categoryId => {
-          if (getCategory(categoryId)?.space_id === page.space_id) {
-            run('INSERT INTO page_categories (page_id,category_id) VALUES (?,?)', [id, categoryId]);
-          }
-        });
-      });
-
-      await saveDB();
-      replaceCurrent('read', id);
+      await saveAll(true);
     } catch (error) {
       toast(`Enregistrement impossible : ${error.message}`, true);
       button.disabled = false;
@@ -1053,12 +2170,12 @@ function insertWikilink(page) {
   if (!editor || !page) return;
   editor.chain().focus().insertContent({
     type: 'wikilink',
-    attrs: { id: page.id, label: page.title?.trim() || 'Sans titre' }
+    attrs: { id: page.id, label: displayTitle(page.title) }
   }).run();
 }
 
 function openPicker(onPick, onCancel = null) {
-  const pages = q('SELECT id,title FROM pages ORDER BY title COLLATE NOCASE');
+  const pages = q(`SELECT id,title FROM pages WHERE deleted_at IS NULL ORDER BY ${TITLE_SORT}`);
   openDialog('Choisir une page', `
     <label class="sr-only" for="pickerSearch">Rechercher une page</label>
     <input class="field" id="pickerSearch" type="search" placeholder="Rechercher une page">
@@ -1067,8 +2184,10 @@ function openPicker(onPick, onCancel = null) {
     const input = dialog.querySelector('#pickerSearch');
     const list = dialog.querySelector('#pickerList');
     const draw = () => {
-      const filtered = pages.filter(page => normalize(page.title).includes(normalize(input.value)));
-      list.innerHTML = filtered.map(page => `<button type="button" class="picker-item" data-pick="${esc(page.id)}">${esc(page.title?.trim() || 'Sans titre')}</button>`).join('') || '<div class="empty">Aucune page.</div>';
+      const raw = input.value.trim();
+      const filtered = pages.filter(page => normalize(displayTitle(page.title)).includes(normalize(raw)));
+      list.innerHTML = filtered.map(page => `<button type="button" class="picker-item" data-pick="${esc(page.id)}">${esc(displayTitle(page.title))}</button>`).join('')
+        || '<div class="empty">Aucune page.</div>';
       list.querySelectorAll('[data-pick]').forEach(button => button.onclick = () => {
         dialog.dataset.picked = 'true';
         const page = pages.find(item => item.id === button.dataset.pick);
@@ -1085,36 +2204,456 @@ function openPicker(onPick, onCancel = null) {
   });
 }
 
+/* ============================================================
+   Infobox
+   Format stocké :
+   { title, subtitle, image, caption,
+     groups: [ { header, rows: [ { label, value } ] } ] }
+
+   Règle reprise de Fandom : un champ vide se cache, un groupe dont
+   tous les champs sont vides se cache, une infobox entièrement vide
+   ne s'affiche pas. C'est ce qui rend l'import permissif — aucun
+   schéma à valider, ce qui manque disparaît simplement.
+   ============================================================ */
+
+const INFOBOX_KEYS = new Set(['title', 'subtitle', 'image', 'caption', 'groups', 'rows']);
+
+function normalizeInfobox(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+
+  const base = {
+    title: String(data.title ?? '').trim(),
+    subtitle: String(data.subtitle ?? '').trim(),
+    image: safeImage(data.image),
+    caption: String(data.caption ?? '').trim(),
+    groups: []
+  };
+
+  const toRows = value => {
+    if (Array.isArray(value)) {
+      return value
+        .map(row => {
+          if (!row || typeof row !== 'object') return null;
+          const label = String(row.label ?? row.key ?? row.nom ?? '').trim();
+          const raw = row.value ?? row.valeur ?? row.val ?? '';
+          const text = Array.isArray(raw) ? raw.join(', ') : String(raw ?? '').trim();
+          return label || text ? { label, value: text } : null;
+        })
+        .filter(Boolean);
+    }
+    if (value && typeof value === 'object') {
+      return Object.entries(value)
+        .map(([label, raw]) => ({
+          label: String(label).trim(),
+          value: Array.isArray(raw) ? raw.join(', ') : String(raw ?? '').trim()
+        }))
+        .filter(row => row.label || row.value);
+    }
+    return [];
+  };
+
+  if (Array.isArray(data.groups)) {
+    base.groups = data.groups
+      .map(group => ({
+        header: String(group?.header ?? group?.titre ?? group?.title ?? '').trim(),
+        rows: toRows(group?.rows ?? group?.fields ?? group?.champs)
+      }))
+      .filter(group => group.header || group.rows.length);
+  } else if (data.rows) {
+    base.groups = [{ header: '', rows: toRows(data.rows) }];
+  } else {
+    /* Objet plat : { "Espèce": "Humaine", "Rang": "Capitaine" }.
+       C'est la forme qu'une IA produit le plus spontanément. */
+    const flat = Object.entries(data)
+      .filter(([key, value]) =>
+        !INFOBOX_KEYS.has(key) &&
+        (typeof value === 'string' || typeof value === 'number' || Array.isArray(value)))
+      .map(([label, value]) => ({
+        label: label.trim(),
+        value: Array.isArray(value) ? value.join(', ') : String(value).trim()
+      }))
+      .filter(row => row.value);
+    if (flat.length) base.groups = [{ header: '', rows: flat }];
+  }
+
+  return base;
+}
+
+function parseInfobox(raw) {
+  if (!raw) return null;
+  try {
+    return normalizeInfobox(typeof raw === 'string' ? JSON.parse(raw) : raw);
+  } catch {
+    return null;
+  }
+}
+
+function infoboxIsEmpty(box) {
+  if (!box) return true;
+  const hasRow = box.groups.some(group => group.rows.some(row => row.value));
+  return !box.title && !box.subtitle && !box.image && !hasRow;
+}
+
+function infoboxText(box) {
+  if (!box) return '';
+  return [
+    box.title, box.subtitle, box.caption,
+    ...box.groups.flatMap(group => [group.header, ...group.rows.flatMap(row => [row.label, row.value])])
+  ].filter(Boolean).join(' ');
+}
+
+function renderInfobox(box, fallbackTitle) {
+  if (infoboxIsEmpty(box)) return '';
+
+  const groups = box.groups
+    .map(group => {
+      const rows = group.rows.filter(row => row.value);
+      if (!rows.length) return '';
+      return `
+        ${group.header ? `<h3 class="ib-header">${esc(group.header)}</h3>` : ''}
+        <dl class="ib-list">
+          ${rows.map(row => `
+            <div class="ib-row">
+              <dt>${esc(row.label)}</dt>
+              <dd>${esc(row.value)}</dd>
+            </div>`).join('')}
+        </dl>`;
+    })
+    .join('');
+
+  return `
+    <aside class="infobox">
+      <div class="ib-top">
+        <div class="ib-titles">
+          <div class="ib-title">${esc(box.title || fallbackTitle || 'Fiche')}</div>
+          ${box.subtitle ? `<div class="ib-sub">${esc(box.subtitle)}</div>` : ''}
+        </div>
+        <button type="button" class="ib-toggle" id="ibToggle" aria-expanded="true" aria-label="Replier la fiche">⌄</button>
+      </div>
+      <div class="ib-body" id="ibBody">
+        ${box.image ? `
+          <figure class="ib-figure">
+            <img src="${esc(box.image)}" alt="">
+            ${box.caption ? `<figcaption>${esc(box.caption)}</figcaption>` : ''}
+          </figure>` : ''}
+        ${groups}
+      </div>
+    </aside>
+  `;
+}
+
+/* Éditeur : quatre briques seulement, comme l'Infobox Builder de Fandom.
+   Titre, image, ligne, en-tête de section. */
+function editInfobox(pageId) {
+  const page = getPage(pageId);
+  if (!page) return;
+
+  const box = parseInfobox(page.infobox) || { title: '', subtitle: '', image: '', caption: '', groups: [] };
+
+  /* On travaille sur une liste à plat : plus simple à réordonner au pouce
+     qu'un arbre de groupes. On la replie en groupes à l'enregistrement. */
+  let items = [];
+  box.groups.forEach(group => {
+    if (group.header) items.push({ kind: 'header', text: group.header });
+    group.rows.forEach(row => items.push({ kind: 'row', label: row.label, value: row.value }));
+  });
+  if (!items.length) items = [{ kind: 'row', label: '', value: '' }];
+
+  let image = box.image || '';
+
+  openDialog('Fiche d’information', `
+    <form id="ibForm">
+      <label class="lab" for="ibTitle">Titre de la fiche</label>
+      <input class="field" id="ibTitle" maxlength="80" value="${esc(box.title)}" placeholder="${esc(displayTitle(page.title))}">
+
+      <label class="lab" for="ibSub">Sous-titre</label>
+      <input class="field" id="ibSub" maxlength="80" value="${esc(box.subtitle)}" placeholder="Personnage, Lieu, Prompt…">
+
+      <div class="ib-image-setting">
+        <span class="lab">Image</span>
+        <button type="button" class="project-image-preview project-image-preview--banner" id="ibImage" aria-label="Choisir une image"></button>
+        <div class="project-image-actions">
+          <button type="button" class="btn-ghost" id="ibPick">Choisir</button>
+          <button type="button" class="btn-ghost danger-text" id="ibClear">Retirer</button>
+        </div>
+        <input class="field" id="ibCaption" maxlength="120" value="${esc(box.caption)}" placeholder="Légende de l’image">
+      </div>
+
+      <div class="lab">Champs</div>
+      <div id="ibItems"></div>
+
+      <div class="ib-add">
+        <button type="button" class="btn-ghost" id="ibAddRow">+ Ligne</button>
+        <button type="button" class="btn-ghost" id="ibAddHeader">+ Section</button>
+      </div>
+
+      <button class="btn-accent quick" type="submit">Enregistrer la fiche</button>
+      <div class="danger-zone">
+        <p>Retirer la fiche ne touche pas au texte de la page.</p>
+        <button type="button" class="btn-danger" id="ibDelete">Supprimer la fiche</button>
+      </div>
+    </form>
+  `, dialog => {
+    const list = dialog.querySelector('#ibItems');
+    const preview = dialog.querySelector('#ibImage');
+
+    const paintImage = () => {
+      preview.style.backgroundImage = image ? `url("${image.replace(/"/g, '%22')}")` : '';
+      preview.textContent = image ? '' : 'Aucune image';
+      preview.classList.toggle('is-empty', !image);
+      dialog.querySelector('#ibClear').disabled = !image;
+    };
+
+    function paintItems() {
+      list.innerHTML = items.map((item, index) => item.kind === 'header'
+        ? `
+          <div class="ib-item ib-item--header">
+            <input class="field" data-field="text" data-index="${index}" value="${esc(item.text)}" placeholder="Nom de la section" maxlength="60">
+            <div class="ib-item-tools">
+              <button type="button" class="ib-tool" data-up="${index}" aria-label="Monter">↑</button>
+              <button type="button" class="ib-tool" data-down="${index}" aria-label="Descendre">↓</button>
+              <button type="button" class="ib-tool danger-text" data-del="${index}" aria-label="Retirer">×</button>
+            </div>
+          </div>`
+        : `
+          <div class="ib-item">
+            <div class="ib-item-fields">
+              <input class="field" data-field="label" data-index="${index}" value="${esc(item.label)}" placeholder="Nom du champ" maxlength="60">
+              <input class="field" data-field="value" data-index="${index}" value="${esc(item.value)}" placeholder="Valeur" maxlength="200">
+            </div>
+            <div class="ib-item-tools">
+              <button type="button" class="ib-tool" data-up="${index}" aria-label="Monter">↑</button>
+              <button type="button" class="ib-tool" data-down="${index}" aria-label="Descendre">↓</button>
+              <button type="button" class="ib-tool danger-text" data-del="${index}" aria-label="Retirer">×</button>
+            </div>
+          </div>`
+      ).join('');
+
+      list.querySelectorAll('[data-field]').forEach(input => {
+        input.oninput = () => {
+          items[Number(input.dataset.index)][input.dataset.field] = input.value;
+        };
+      });
+      list.querySelectorAll('[data-up]').forEach(button => {
+        button.onclick = () => {
+          const index = Number(button.dataset.up);
+          if (index === 0) return;
+          [items[index - 1], items[index]] = [items[index], items[index - 1]];
+          paintItems();
+        };
+      });
+      list.querySelectorAll('[data-down]').forEach(button => {
+        button.onclick = () => {
+          const index = Number(button.dataset.down);
+          if (index >= items.length - 1) return;
+          [items[index + 1], items[index]] = [items[index], items[index + 1]];
+          paintItems();
+        };
+      });
+      list.querySelectorAll('[data-del]').forEach(button => {
+        button.onclick = () => {
+          items.splice(Number(button.dataset.del), 1);
+          paintItems();
+        };
+      });
+    }
+
+    dialog.querySelector('#ibPick').onclick = async () => {
+      const picked = await pickImage();
+      if (picked) {
+        image = picked;
+        paintImage();
+      }
+    };
+    preview.onclick = dialog.querySelector('#ibPick').onclick;
+    dialog.querySelector('#ibClear').onclick = () => {
+      image = '';
+      paintImage();
+    };
+
+    dialog.querySelector('#ibAddRow').onclick = () => {
+      items.push({ kind: 'row', label: '', value: '' });
+      paintItems();
+    };
+    dialog.querySelector('#ibAddHeader').onclick = () => {
+      items.push({ kind: 'header', text: '' });
+      paintItems();
+    };
+
+    dialog.querySelector('#ibDelete').onclick = async () => {
+      run('UPDATE pages SET infobox = ?, updated_at = ? WHERE id = ?', ['{}', Date.now(), pageId]);
+      await refreshSearchText(pageId);
+      await saveDB();
+      dialog.remove();
+      render();
+      toast('Fiche supprimée.');
+    };
+
+    dialog.querySelector('#ibForm').onsubmit = async event => {
+      event.preventDefault();
+
+      const groups = [];
+      let current = { header: '', rows: [] };
+      items.forEach(item => {
+        if (item.kind === 'header') {
+          if (current.header || current.rows.length) groups.push(current);
+          current = { header: item.text.trim(), rows: [] };
+        } else if (item.label.trim() || item.value.trim()) {
+          current.rows.push({ label: item.label.trim(), value: item.value.trim() });
+        }
+      });
+      if (current.header || current.rows.length) groups.push(current);
+
+      const next = {
+        title: dialog.querySelector('#ibTitle').value.trim(),
+        subtitle: dialog.querySelector('#ibSub').value.trim(),
+        image,
+        caption: dialog.querySelector('#ibCaption').value.trim(),
+        groups
+      };
+
+      run('UPDATE pages SET infobox = ?, updated_at = ? WHERE id = ?',
+        [JSON.stringify(next), Date.now(), pageId]);
+      await refreshSearchText(pageId);
+      await saveDB();
+      dialog.remove();
+      render();
+      toast('Fiche enregistrée.');
+    };
+
+    paintImage();
+    paintItems();
+  });
+}
+
+async function refreshSearchText(pageId) {
+  const page = getPage(pageId);
+  if (!page) return;
+  run('UPDATE pages SET search_text = ? WHERE id = ?', [
+    buildSearchText(page.title, page.body, page.infobox),
+    pageId
+  ]);
+}
+
+/* Sommaire construit depuis les titres du corps : on ne relit pas le
+   wikitext, le HTML est déjà structuré. */
+function buildTOC(html) {
+  const parsed = new DOMParser().parseFromString(String(html || ''), 'text/html');
+  const headings = [...parsed.body.querySelectorAll('h2, h3, h4')];
+  if (headings.length < 3) return { toc: '', ids: [] };
+
+  const ids = [];
+  const items = headings.map((heading, index) => {
+    const id = `sec-${index}`;
+    ids.push(id);
+    const level = Number(heading.tagName[1]);
+    return `<li class="toc-l${level}"><a href="#${id}" data-toc="${id}">${esc(heading.textContent.trim())}</a></li>`;
+  }).join('');
+
+  return {
+    toc: `
+      <nav class="toc" aria-label="Sommaire">
+        <div class="toc-head">
+          <span class="toc-title">Sommaire</span>
+          <button type="button" class="toc-toggle" id="tocToggle" aria-expanded="true">masquer</button>
+        </div>
+        <ol class="toc-list" id="tocList">${items}</ol>
+      </nav>`,
+    ids
+  };
+}
+
 function screenRead(id) {
   const page = getPage(id);
   if (!page) return goHome();
   const space = page.space_id ? getSpace(page.space_id) : null;
   const categories = getPageCategories(id);
-  const backlinks = q('SELECT id,title,body,updated_at,is_pinned FROM pages WHERE id<>? AND body LIKE ?', [id, `%data-wikilink="${id}"%`]);
+  const backlinks = q('SELECT id,title,body,space_id,updated_at,is_pinned FROM pages WHERE id<>? AND body LIKE ? AND deleted_at IS NULL', [id, `%data-wikilink="${id}"%`]);
+  const body = sanitizeHTML(page.body || '<p>Page vide.</p>');
+  const { toc, ids } = buildTOC(body);
+  const title = displayTitle(page.title);
 
   app.innerHTML = `
     ${wrapHeader(space, page, globalHeader())}
     <main class="read">
       ${safeImage(page.cover) ? `<img class="page-cover" src="${esc(safeImage(page.cover))}" alt="">` : ''}
-      <h1 class="page-title">${esc(page.title?.trim() || 'Sans titre')}</h1>
+      <h1 class="page-title">${esc(title)}</h1>
       ${categories.length ? `<div class="category-chips">${categories.map(category => `<button type="button" class="category-chip" data-category="${esc(category.id)}">${esc(category.name)}</button>`).join('')}</div>` : ''}
-      <div class="project-actions read-actions"><button type="button" class="action-link" id="editPage">✎ Modifier</button><button type="button" class="action-link" id="galleryPage">▦ Galerie</button><button type="button" class="action-link" id="duplicatePage">＋ Dupliquer</button><button type="button" class="action-link" id="exportPdf">↓ Export PDF</button><button type="button" class="action-link danger-text" id="deletePage">× Supprimer</button></div>
-      <article class="page-body">${sanitizeHTML(page.body || '<p>Page vide.</p>')}</article>
+      ${page.deleted_at ? `
+        <div class="trash-banner">
+          <span>Cette page est dans la corbeille.</span>
+          <button type="button" class="btn-accent" id="restoreHere">Restaurer</button>
+        </div>
+      ` : `
+      <div class="read-actions">
+        <button type="button" class="action-link" id="pinPage" aria-pressed="${Boolean(page.is_pinned)}"><span class="ai">${page.is_pinned ? '★' : '☆'}</span>${page.is_pinned ? 'Épinglé' : 'Épingler'}</button>
+        <button type="button" class="action-link" id="editPage"><span class="ai">✎</span>Modifier</button>
+        <button type="button" class="action-link icon-only" id="moreActions" aria-label="Plus d'actions">⋮</button>
+      </div>`}
+      ${renderInfobox(parseInfobox(page.infobox), title)}
+      ${toc}
+      <article class="page-body">${body}</article>
       <div class="sec">Liens entrants</div>${backlinks.map(pageCard).join('') || '<div class="empty">Aucun lien entrant.</div>'}
     </main>
   `;
 
+  /* Les identifiants sont posés sur le DOM réel, dans le même ordre
+     que ceux calculés pour le sommaire. */
+  if (ids.length) {
+    const headings = [...app.querySelectorAll('.page-body h2, .page-body h3, .page-body h4')];
+    headings.forEach((heading, index) => { heading.id = ids[index]; });
+    app.querySelectorAll('[data-toc]').forEach(link => {
+      link.onclick = event => {
+        event.preventDefault();
+        document.getElementById(link.dataset.toc)
+          ?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      };
+    });
+    const tocToggle = document.getElementById('tocToggle');
+    if (tocToggle) {
+      tocToggle.onclick = () => {
+        const list = document.getElementById('tocList');
+        const open = tocToggle.getAttribute('aria-expanded') === 'true';
+        tocToggle.setAttribute('aria-expanded', String(!open));
+        tocToggle.textContent = open ? 'afficher' : 'masquer';
+        list.hidden = open;
+      };
+    }
+  }
+
+  const ibToggle = document.getElementById('ibToggle');
+  if (ibToggle) {
+    ibToggle.onclick = () => {
+      const ibBody = document.getElementById('ibBody');
+      const open = ibToggle.getAttribute('aria-expanded') === 'true';
+      ibToggle.setAttribute('aria-expanded', String(!open));
+      ibToggle.classList.toggle('closed', open);
+      ibBody.hidden = open;
+    };
+  }
+
   bindGlobal();
-  document.getElementById('editPage').onclick = () => go('edit', id);
-  document.getElementById('galleryPage').onclick = () => go('gallery', id);
-  document.getElementById('duplicatePage').onclick = () => duplicatePage(id);
-  document.getElementById('deletePage').onclick = () => deletePage(id);
-  document.getElementById('exportPdf').onclick = () => exportPagePDF(page, space);
+  if (page.deleted_at) {
+    document.getElementById('restoreHere').onclick = () => restorePage(id);
+  } else {
+    document.getElementById('pinPage').onclick = () => togglePin(id);
+    document.getElementById('editPage').onclick = () => go('edit', id);
+    document.getElementById('moreActions').onclick = event =>
+      openReadMenu(event.currentTarget, page, space);
+  }
   wirePages();
 
   app.querySelectorAll('a[data-wikilink]').forEach(link => {
-    const target = getPage(link.dataset.wikilink);
-    link.textContent = target?.title?.trim() || 'Page supprimée';
+    const targetId = link.dataset.wikilink;
+    const target = getPage(targetId);
+    /* Fandom : un lien vers la page courante s'affiche en gras, pas en lien. */
+    if (targetId === id) {
+      link.classList.add('self');
+      link.removeAttribute('href');
+      link.onclick = event => event.preventDefault();
+      return;
+    }
+    link.textContent = target ? displayTitle(target.title) : 'Page supprimée';
     link.classList.toggle('dead', !target);
     link.removeAttribute('href');
     link.onclick = event => {
@@ -1122,6 +2661,66 @@ function screenRead(id) {
       if (target) go('read', target.id);
     };
   });
+}
+
+function openReadMenu(anchor, page, space) {
+  return buildMenu(anchor, [
+    { label: parseInfobox(page.infobox) ? 'Modifier la fiche' : 'Ajouter une fiche', run: () => editInfobox(page.id) },
+    { label: 'Galerie', run: () => go('gallery', page.id) },
+    { label: 'Déplacer vers…', run: () => moveDialog([page.id], null) },
+    { label: 'Dupliquer', run: () => duplicatePage(page.id) },
+    { label: 'Export PDF', run: () => exportPagePDF(page, space) },
+    { label: 'Mettre à la corbeille', danger: true, run: () => trashPage(page.id, back) }
+  ]);
+}
+
+/* Positionnement commun à tous les menus contextuels. */
+function buildMenu(anchor, items) {
+  closeActiveMenu?.();
+
+  const menu = document.createElement('div');
+  menu.className = 'more-menu quick-page-menu';
+  menu.innerHTML = items.map((item, index) =>
+    `<button type="button" class="more-menu-item${item.danger ? ' danger' : ''}" data-index="${index}">${esc(item.label)}</button>`
+  ).join('');
+  document.body.appendChild(menu);
+
+  const rect = anchor.getBoundingClientRect();
+  const menuWidth = menu.offsetWidth;
+  const menuHeight = menu.offsetHeight;
+  const left = Math.min(window.innerWidth - menuWidth - 12, Math.max(12, rect.right - menuWidth));
+  const top = rect.bottom + menuHeight + 12 <= window.innerHeight
+    ? rect.bottom + 6
+    : Math.max(12, rect.top - menuHeight - 6);
+
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
+
+  let outsideListener = null;
+  /* Le listener document doit mourir avec le menu, y compris quand
+     c'est cleanup() qui le retire lors d'un changement d'écran. */
+  const close = () => {
+    menu.remove();
+    if (outsideListener) document.removeEventListener('pointerdown', outsideListener, true);
+    if (closeActiveMenu === close) closeActiveMenu = null;
+  };
+  closeActiveMenu = close;
+
+  menu.querySelectorAll('[data-index]').forEach(button => {
+    button.onclick = () => {
+      close();
+      items[Number(button.dataset.index)].run();
+    };
+  });
+
+  setTimeout(() => {
+    outsideListener = event => {
+      if (!menu.contains(event.target) && event.target !== anchor) close();
+    };
+    document.addEventListener('pointerdown', outsideListener, true);
+  }, 0);
+
+  return menu;
 }
 
 async function togglePin(id) {
@@ -1138,43 +2737,57 @@ async function duplicatePage(id, navigate = true) {
   if (!page) return null;
   const copyId = uid();
   const now = Date.now();
+  const title = `${displayTitle(page.title)} (copie)`;
   transaction(() => {
-    run('INSERT INTO pages (id,title,body,created_at,updated_at,is_inbox,space_id,template_id,infobox,cover,title_align) VALUES (?,?,?,?,?,?,?,?,?,?,?)', [copyId, `${page.title || 'Sans titre'} (copie)`, page.body || '', now, now, page.space_id ? 0 : 1, page.space_id, page.template_id, page.infobox || '{}', page.cover || null, page.title_align || 'left']);
+    run('INSERT INTO pages (id,title,body,created_at,updated_at,is_inbox,space_id,template_id,infobox,cover,title_align,search_text) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', [copyId, title, page.body || '', now, now, page.space_id ? 0 : 1, page.space_id, page.template_id, page.infobox || '{}', page.cover || null, page.title_align || 'left', buildSearchText(title, page.body, page.infobox)]);
     getPageCategories(id).forEach(category => run('INSERT INTO page_categories (page_id,category_id) VALUES (?,?)', [copyId, category.id]));
+    /* La galerie suivait la page : une copie sans ses images n'en est pas une. */
+    q('SELECT * FROM page_gallery WHERE page_id = ? ORDER BY position', [id]).forEach(item => {
+      run('INSERT INTO page_gallery (id,page_id,data_url,caption,position,created_at) VALUES (?,?,?,?,?,?)',
+        [uid(), copyId, item.data_url, item.caption, item.position, now]);
+    });
   });
   await saveDB();
   if (navigate) go('read', copyId);
   return copyId;
 }
 
-function exportPagePDF(page, space) {
-  if (typeof html2pdf === 'undefined') {
-    toast('Librairie PDF non chargée.', true);
-    return;
-  }
-
-  const safeTitle = page.title?.trim() || 'Page';
-  const fileName = `${safeTitle.replace(/[^a-z0-9- ]/gi, '_')}.pdf`;
-
+/* Le moteur PDF (250 ko) n'est plus téléchargé au démarrage : on va le
+   chercher seulement quand on appuie sur le bouton. */
+async function exportPagePDF(page, space) {
   const article = document.querySelector('.read');
   if (!article) {
     toast('Impossible de lire la page.', true);
     return;
   }
 
-  const actions = article.querySelector('.read-actions');
-  const prevDisplay = actions?.style.display || '';
-  actions?.style.setProperty('display', 'none', 'important');
   toast('Préparation du PDF...');
 
-  setTimeout(() => {
-    html2pdf()
+  let engine;
+  try {
+    engine = await window.loadHtml2Pdf();
+  } catch {
+    toast('L\'export PDF nécessite une connexion internet.', true);
+    return;
+  }
+
+  const safeTitle = displayTitle(page.title);
+  const fileName = `${safeTitle.replace(/[^a-z0-9- ]/gi, '_')}.pdf`;
+
+  const hidden = [...article.querySelectorAll('.read-actions, .toc-toggle, .ib-toggle')];
+  const previous = hidden.map(element => element.style.display);
+  hidden.forEach(element => element.style.setProperty('display', 'none', 'important'));
+
+  try {
+    await engine()
       .set({
         filename: fileName,
         margin: [10, 10, 10, 10],
         image: { type: 'jpeg', quality: 0.96 },
         html2canvas: {
-          scale: 2,
+          /* 1.5 au lieu de 2 : sur une page longue, scale 2 fait
+             sauter l'onglet par manque de mémoire sur mobile. */
+          scale: 1.5,
           useCORS: true,
           allowTaint: true,
           backgroundColor: getComputedStyle(document.body).getPropertyValue('--project-bg') || '#111'
@@ -1183,91 +2796,129 @@ function exportPagePDF(page, space) {
         pagebreak: { mode: ['css', 'legacy'] }
       })
       .from(article)
-      .save()
-      .then(() => {
-        if (actions) actions.style.display = prevDisplay;
-        toast('PDF enregistré.');
-      })
-      .catch(error => {
-        if (actions) actions.style.display = prevDisplay;
-        toast(`Export impossible : ${error.message}`, true);
-      });
-  }, 150);
+      .save();
+    toast('PDF enregistré.');
+  } catch (error) {
+    toast(`Export impossible : ${error.message}`, true);
+  } finally {
+    hidden.forEach((element, index) => { element.style.display = previous[index]; });
+  }
 }
 
-function deletePage(id) {
-  confirmDialog('Supprimer cette page ?', 'La page et sa galerie seront définitivement supprimées.', async () => {
-    transaction(() => {
-      run('DELETE FROM page_gallery WHERE page_id = ?', [id]);
-      run('DELETE FROM page_categories WHERE page_id = ?', [id]);
-      run('DELETE FROM pages WHERE id = ?', [id]);
-    });
+/* Réversible : pas de confirmation, une annulation dans le toast.
+   C'est le geste courant, il doit être rapide. */
+async function trashPage(id, after = null) {
+  run('UPDATE pages SET deleted_at = ? WHERE id = ?', [Date.now(), id]);
+  await saveDB();
+  if (after) after(); else render();
+
+  toast('Page mise à la corbeille', false, {
+    label: 'Annuler',
+    run: async () => {
+      run('UPDATE pages SET deleted_at = NULL WHERE id = ?', [id]);
+      await saveDB();
+      render();
+      toast('Page restaurée.');
+    }
+  });
+}
+
+async function restorePage(id) {
+  run('UPDATE pages SET deleted_at = NULL WHERE id = ?', [id]);
+  await saveDB();
+  render();
+  toast('Page restaurée.');
+}
+
+/* Irréversible : c'est ici, et seulement ici, qu'on prévient des liens
+   entrants qui vont mourir. */
+function destroyPage(id) {
+  const page = getPage(id);
+  if (!page) return;
+  const entrants = q('SELECT title FROM pages WHERE id <> ? AND body LIKE ? AND deleted_at IS NULL', [id, `%data-wikilink="${id}"%`]);
+  const message = entrants.length
+    ? `${entrants.length} ${plural(entrants.length, 'page')} ${entrants.length > 1 ? 'pointent' : 'pointe'} encore vers celle-ci (${entrants.slice(0, 3).map(item => displayTitle(item.title)).join(', ')}${entrants.length > 3 ? '…' : ''}). Ces liens deviendront morts, sans retour possible.`
+    : 'La page et sa galerie seront perdues définitivement.';
+
+  confirmDialog(`Supprimer « ${displayTitle(page.title)} » ?`, message, async () => {
+    transaction(() => hardDeletePage(id));
     await saveDB();
-    back();
+    render();
+    toast('Page supprimée définitivement.');
+  });
+}
+
+function screenTrash() {
+  const pages = q('SELECT id,title,body,space_id,deleted_at FROM pages WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC');
+
+  app.innerHTML = `
+    ${globalHeader('Corbeille')}
+    <main>
+      <div class="trash-note">
+        <p>Les pages sont supprimées définitivement au bout de ${TRASH_DAYS} jours.</p>
+        ${pages.length ? '<button type="button" class="btn-ghost danger-text" id="emptyTrash">Vider la corbeille</button>' : ''}
+      </div>
+      ${pages.map(page => {
+        const left = Math.max(0, TRASH_DAYS - Math.floor((Date.now() - page.deleted_at) / 86400000));
+        const space = spaceOf(page.space_id);
+        return `
+          <div class="card row trash-row">
+            <span class="grow">
+              <span class="t">${esc(displayTitle(page.title))}</span>
+              <span class="p">${esc(space?.name || 'Inbox')} · supprimée le ${fmt(page.deleted_at)}</span>
+              <span class="d">${left} ${plural(left, 'jour')} avant suppression définitive</span>
+            </span>
+            <button type="button" class="icon-btn" data-trash-menu="${esc(page.id)}" aria-label="Actions">⋮</button>
+          </div>`;
+      }).join('') || '<div class="empty">La corbeille est vide.</div>'}
+    </main>
+  `;
+
+  bindGlobal();
+
+  document.getElementById('emptyTrash')?.addEventListener('click', () => {
+    confirmDialog(
+      'Vider la corbeille ?',
+      `${pages.length} ${plural(pages.length, 'page')} ${pages.length > 1 ? 'seront perdues' : 'sera perdue'} définitivement.`,
+      async () => {
+        transaction(() => pages.forEach(page => hardDeletePage(page.id)));
+        await saveDB();
+        render();
+        toast('Corbeille vidée.');
+      }
+    );
+  });
+
+  app.querySelectorAll('[data-trash-menu]').forEach(button => {
+    button.onclick = () => buildMenu(button, [
+      { label: 'Restaurer', run: () => restorePage(button.dataset.trashMenu) },
+      { label: 'Supprimer définitivement', danger: true, run: () => destroyPage(button.dataset.trashMenu) }
+    ]);
   });
 }
 
 function openRecentPageMenu(anchor, id) {
-  document.querySelector('.quick-page-menu')?.remove();
-
   const page = getPage(id);
   if (!page) return;
 
-  const menu = document.createElement('div');
-  menu.className = 'more-menu quick-page-menu';
-  menu.innerHTML = `
-    <button type="button" class="more-menu-item" data-action="rename">Renommer</button>
-    <button type="button" class="more-menu-item" data-action="duplicate">Dupliquer</button>
-    <button type="button" class="more-menu-item danger" data-action="delete">Supprimer</button>
-  `;
-  document.body.appendChild(menu);
-
-  const rect = anchor.getBoundingClientRect();
-  const menuWidth = menu.offsetWidth;
-  const menuHeight = menu.offsetHeight;
-  const left = Math.min(window.innerWidth - menuWidth - 12, Math.max(12, rect.right - menuWidth));
-  const top = rect.bottom + menuHeight + 12 <= window.innerHeight
-    ? rect.bottom + 6
-    : Math.max(12, rect.top - menuHeight - 6);
-
-  menu.style.left = `${left}px`;
-  menu.style.top = `${top}px`;
-
-  let outsideListener = null;
-  const close = () => {
-    menu.remove();
-    if (outsideListener) document.removeEventListener('pointerdown', outsideListener, true);
-  };
-
-  menu.querySelector('[data-action="rename"]').onclick = () => {
-    close();
-    renamePageFromHome(id);
-  };
-
-  menu.querySelector('[data-action="duplicate"]').onclick = async event => {
-    event.currentTarget.disabled = true;
-    try {
-      await duplicatePage(id, false);
-      close();
-      render();
-      toast('Page dupliquée.');
-    } catch (error) {
-      close();
-      toast(`Duplication impossible : ${error.message}`, true);
-    }
-  };
-
-  menu.querySelector('[data-action="delete"]').onclick = () => {
-    close();
-    deletePageFromHome(id);
-  };
-
-  setTimeout(() => {
-    outsideListener = event => {
-      if (!menu.contains(event.target) && event.target !== anchor) close();
-    };
-    document.addEventListener('pointerdown', outsideListener, true);
-  }, 0);
+  buildMenu(anchor, [
+    { label: page.is_pinned ? 'Désépingler' : 'Épingler', run: () => togglePin(id) },
+    { label: 'Renommer', run: () => renamePageFromHome(id) },
+    { label: 'Déplacer vers…', run: () => moveDialog([id], null) },
+    {
+      label: 'Dupliquer',
+      run: async () => {
+        try {
+          await duplicatePage(id, false);
+          render();
+          toast('Page dupliquée.');
+        } catch (error) {
+          toast(`Duplication impossible : ${error.message}`, true);
+        }
+      }
+    },
+    { label: 'Mettre à la corbeille', danger: true, run: () => trashPage(id) }
+  ]);
 }
 
 function renamePageFromHome(id) {
@@ -1293,8 +2944,10 @@ function renamePageFromHome(id) {
 
     dialog.querySelector('#renamePageForm').onsubmit = async event => {
       event.preventDefault();
-      run('UPDATE pages SET title = ?, updated_at = ? WHERE id = ?', [
-        input.value.trim(),
+      const title = input.value.trim();
+      run('UPDATE pages SET title = ?, search_text = ?, updated_at = ? WHERE id = ?', [
+        title,
+        buildSearchText(title, page.body, page.infobox),
         Date.now(),
         id
       ]);
@@ -1303,19 +2956,6 @@ function renamePageFromHome(id) {
       render();
       toast('Page renommée.');
     };
-  });
-}
-
-function deletePageFromHome(id) {
-  confirmDialog('Supprimer cette page ?', 'La page et sa galerie seront définitivement supprimées.', async () => {
-    transaction(() => {
-      run('DELETE FROM page_gallery WHERE page_id = ?', [id]);
-      run('DELETE FROM page_categories WHERE page_id = ?', [id]);
-      run('DELETE FROM pages WHERE id = ?', [id]);
-    });
-    await saveDB();
-    render();
-    toast('Page supprimée.');
   });
 }
 
@@ -1328,19 +2968,27 @@ function screenGallery(pageId) {
   app.innerHTML = `
     ${wrapHeader(space, page, globalHeader('Galerie'))}
     <main><div class="sec">Galerie de la page</div>
-      ${items.length ? `<div class="gallery-grid">${items.map(item => `<div class="gallery-item"><img src="${esc(safeImage(item.data_url))}" alt=""><input class="field gal-caption" data-caption="${item.id}" value="${esc(item.caption || '')}" placeholder="Légende"><button type="button" class="btn-ghost danger-text" data-remove="${item.id}">Retirer</button></div>`).join('')}</div>` : '<div class="empty">Aucune image dans cette galerie.</div>'}
-      <button type="button" class="btn-accent quick" id="addGallery">+ Ajouter une image</button>
+      ${items.length ? `<div class="gallery-grid">${items.map(item => `<div class="gallery-item"><img src="${esc(safeImage(item.data_url))}" alt="" loading="lazy"><input class="field gal-caption" data-caption="${item.id}" value="${esc(item.caption || '')}" placeholder="Légende"><button type="button" class="btn-ghost danger-text" data-remove="${item.id}">Retirer</button></div>`).join('')}</div>` : '<div class="empty">Aucune image dans cette galerie.</div>'}
+      <button type="button" class="btn-accent quick" id="addGallery">+ Ajouter des images</button>
     </main>
   `;
 
   bindGlobal();
   document.getElementById('addGallery').onclick = async () => {
-    const image = await pickImage();
-    if (!image) return;
+    const images = await pickImages();
+    if (!images.length) return;
     const max = q('SELECT MAX(position) position FROM page_gallery WHERE page_id = ?', [pageId])[0].position;
-    run('INSERT INTO page_gallery (id,page_id,data_url,caption,position,created_at) VALUES (?,?,?,?,?,?)', [uid(), pageId, image, '', (max ?? -1) + 1, Date.now()]);
+    let position = (max ?? -1) + 1;
+    const now = Date.now();
+    transaction(() => {
+      images.forEach(image => {
+        run('INSERT INTO page_gallery (id,page_id,data_url,caption,position,created_at) VALUES (?,?,?,?,?,?)',
+          [uid(), pageId, image, '', position++, now]);
+      });
+    });
     await saveDB();
     render();
+    toast(`${images.length} ${plural(images.length, 'image')} ${images.length > 1 ? 'ajoutées' : 'ajoutée'}.`);
   };
   app.querySelectorAll('[data-remove]').forEach(button => button.onclick = () => {
     confirmDialog('Retirer cette image ?', 'Cette action est définitive.', async () => {
@@ -1361,47 +3009,75 @@ function screenTemplates() {
   bindGlobal();
 }
 
-function pickImage() {
+/* Une image choisie est redimensionnée puis compressée. Le PNG reste en
+   PNG s'il a de la transparence : sinon un logo se retrouvait avec un
+   rectangle blanc, très visible sur le thème sombre. */
+function processImageFile(file) {
+  return new Promise(resolve => {
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 12 * 1024 * 1024) {
+      resolve(null);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => resolve(null);
+    reader.onload = () => {
+      const image = new Image();
+      image.onerror = () => resolve(null);
+      image.onload = () => {
+        const scale = Math.min(1, 1400 / image.naturalWidth, 1400 / image.naturalHeight);
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+        canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+        const context = canvas.getContext('2d');
+        if (!context) return resolve(null);
+
+        const keepAlpha = file.type === 'image/png' || file.type === 'image/webp';
+        if (!keepAlpha) {
+          context.fillStyle = '#fff';
+          context.fillRect(0, 0, canvas.width, canvas.height);
+        }
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        resolve(keepAlpha
+          ? canvas.toDataURL('image/png')
+          : canvas.toDataURL('image/jpeg', .82));
+      };
+      image.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function pickImages(multiple = true) {
   return new Promise(resolve => {
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = 'image/jpeg,image/png,image/webp';
-    input.onchange = () => {
-      const file = input.files?.[0];
-      if (!file) return resolve(null);
-      if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 12 * 1024 * 1024) {
-        toast('Choisis une image JPEG, PNG ou WebP de moins de 12 Mo.', true);
-        return resolve(null);
+    if (multiple) input.multiple = true;
+    input.onchange = async () => {
+      const files = [...(input.files || [])];
+      if (!files.length) return resolve([]);
+      const results = [];
+      let rejected = 0;
+      for (const file of files) {
+        const processed = await processImageFile(file);
+        if (processed) results.push(processed); else rejected++;
       }
-      const reader = new FileReader();
-      reader.onerror = () => resolve(null);
-      reader.onload = () => {
-        const image = new Image();
-        image.onerror = () => resolve(null);
-        image.onload = () => {
-          const scale = Math.min(1, 1400 / image.naturalWidth, 1400 / image.naturalHeight);
-          const canvas = document.createElement('canvas');
-          canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
-          canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
-          const context = canvas.getContext('2d');
-          if (!context) return resolve(null);
-          context.fillStyle = '#fff';
-          context.fillRect(0, 0, canvas.width, canvas.height);
-          context.drawImage(image, 0, 0, canvas.width, canvas.height);
-          resolve(canvas.toDataURL('image/jpeg', .82));
-        };
-        image.src = reader.result;
-      };
-      reader.readAsDataURL(file);
+      if (rejected) toast(`${rejected} ${plural(rejected, 'image')} ignorée${rejected > 1 ? 's' : ''} (format ou taille).`, true);
+      resolve(results);
     };
     input.click();
   });
 }
 
-function openDialog(title, content, setup) {
+const pickImage = async () => (await pickImages(false))[0] || null;
+
+/* options.center : boîte centrée à l'écran plutôt que feuille collée
+   en bas. Réservé aux confirmations, qui doivent capter le regard. */
+function openDialog(title, content, setup, options = {}) {
   const overlay = document.createElement('div');
-  overlay.className = 'overlay';
-  overlay.innerHTML = `<section class="sheet" role="dialog" aria-modal="true" aria-labelledby="dialogTitle"><div class="sheet-head"><h2 id="dialogTitle">${esc(title)}</h2><button type="button" class="icon-btn" data-close aria-label="Fermer">X</button></div>${content}</section>`;
+  overlay.className = `overlay${options.center ? ' center' : ''}`;
+  overlay.tabIndex = -1;
+  overlay.innerHTML = `<section class="sheet" role="dialog" aria-modal="true" aria-labelledby="dialogTitle"><div class="sheet-head"><h2 id="dialogTitle">${esc(title)}</h2><button type="button" class="icon-btn" data-close aria-label="Fermer">✕</button></div>${content}</section>`;
   document.body.appendChild(overlay);
   const close = () => {
     overlay.dispatchEvent(new CustomEvent('dialog-cancel'));
@@ -1415,26 +3091,176 @@ function openDialog(title, content, setup) {
     if (event.key === 'Escape') close();
   };
   setup?.(overlay);
+  /* Sans focus sur le conteneur, la touche Échap ne remontait pas. */
+  if (!overlay.querySelector('input, textarea, select')) overlay.focus();
   return overlay;
 }
 
 function confirmDialog(title, message, onConfirm) {
-  openDialog(title, `<p>${esc(message)}</p><div class="confirm-actions"><button type="button" class="cancel" data-cancel>Annuler</button><button type="button" class="danger" data-confirm>Confirmer</button></div>`, dialog => {
+  openDialog(title, `<p class="confirm-msg">${esc(message)}</p><div class="confirm-actions"><button type="button" class="cancel" data-cancel>Annuler</button><button type="button" class="danger" data-confirm>Confirmer</button></div>`, dialog => {
     dialog.querySelector('[data-cancel]').onclick = () => dialog.remove();
     dialog.querySelector('[data-confirm]').onclick = async event => {
       event.currentTarget.disabled = true;
       await onConfirm();
       dialog.remove();
     };
+  }, { center: true });
+}
+
+/* ============================================================
+   Paramètres, Apparence, Guide
+   ============================================================ */
+
+function settingRow(id, iconText, title, hint) {
+  return `
+    <button type="button" class="setting-row" data-setting="${id}">
+      <span class="setting-ico">${iconText}</span>
+      <span class="grow">
+        <span class="setting-t">${esc(title)}</span>
+        <span class="setting-h">${esc(hint)}</span>
+      </span>
+      <span class="setting-arrow" aria-hidden="true">›</span>
+    </button>
+  `;
+}
+
+/* Trois choses qu'on veut pouvoir vérifier d'un coup d'oeil : l'app
+   démarre-t-elle sans réseau, les données sont-elles à l'abri d'une
+   purge du navigateur, et combien pèsent-elles. */
+async function offlineDiagnostics() {
+  const state = {
+    ready: false,
+    sw: 'Service Worker inactif',
+    persist: 'Stockage temporaire',
+    persisted: false,
+    usage: ''
+  };
+
+  try {
+    if ('serviceWorker' in navigator) {
+      const registration = await navigator.serviceWorker.getRegistration();
+      if (registration && navigator.serviceWorker.controller) {
+        state.ready = true;
+        state.sw = 'Prêt hors ligne';
+      } else if (registration) {
+        state.sw = 'Installation en cours…';
+      }
+    }
+  } catch { /* non bloquant */ }
+
+  try {
+    if (navigator.storage?.persisted) {
+      state.persisted = await navigator.storage.persisted();
+      state.persist = state.persisted ? 'Stockage permanent' : 'Stockage temporaire';
+    }
+  } catch { /* non bloquant */ }
+
+  try {
+    if (navigator.storage?.estimate) {
+      const { usage } = await navigator.storage.estimate();
+      if (usage) state.usage = `${(usage / 1048576).toFixed(1)} Mo utilisés`;
+    }
+  } catch { /* non bloquant */ }
+
+  return state;
+}
+
+function screenSettings() {
+  const dark = document.documentElement.dataset.theme !== 'light';
+  const pages = q('SELECT COUNT(*) count FROM pages WHERE deleted_at IS NULL')[0].count;
+  const spaces = q('SELECT COUNT(*) count FROM spaces')[0].count;
+  const trashed = trashCount();
+
+  app.innerHTML = `
+    ${globalHeader('Paramètres')}
+    <main>
+      <div class="setting-group">
+        <div class="setting-legend">Affichage</div>
+        ${settingRow('appearance', '🎨', 'Apparence de l’accueil', 'Couleur du header et du fond')}
+        <button type="button" class="setting-row" data-setting="theme">
+          <span class="setting-ico">◐</span>
+          <span class="grow">
+            <span class="setting-t">Thème général</span>
+            <span class="setting-h">${dark ? 'Sombre' : 'Clair'}</span>
+          </span>
+          <span class="setting-toggle${dark ? '' : ' on'}" aria-hidden="true"></span>
+        </button>
+      </div>
+
+      <div class="setting-group">
+        <div class="setting-legend">Données</div>
+        ${settingRow('json', '📥', 'Importer depuis JSON', 'Récupérer une page générée par une IA')}
+        ${settingRow('export', '💾', 'Exporter mes données', 'Télécharger une sauvegarde .db')}
+        ${settingRow('import', '📂', 'Importer une sauvegarde', 'Remplace les données actuelles')}
+        ${settingRow('trash', '🗑', 'Corbeille', trashed ? `${trashed} ${plural(trashed, 'page')} en attente` : 'Vide')}
+      </div>
+
+      <div class="setting-group">
+        <div class="setting-legend">Hors ligne</div>
+        <div class="offline-card" id="offlineCard">
+          <div class="offline-line"><span class="offline-dot wait"></span>Vérification…</div>
+        </div>
+      </div>
+
+      <div class="setting-group">
+        <div class="setting-legend">Aide</div>
+        ${settingRow('guide', '📖', 'Guide des fonctionnalités', 'Comment marche chaque outil')}
+      </div>
+
+      <div class="setting-stats">
+        <span>${pages} ${plural(pages, 'page')}</span>
+        <span>${spaces} ${plural(spaces, 'projet')}</span>
+        <span>${trashed} en corbeille</span>
+      </div>
+    </main>
+  `;
+
+  bindGlobal();
+  app.querySelectorAll('[data-setting]').forEach(button => {
+    button.onclick = () => {
+      const key = button.dataset.setting;
+      if (key === 'theme') {
+        document.documentElement.dataset.theme = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+        localStorage.setItem('theme', document.documentElement.dataset.theme);
+        render();
+        return;
+      }
+      if (key === 'json') return importJSON();
+      if (key === 'export') return exportDB();
+      if (key === 'import') return importDB();
+      if (key === 'trash') return go('trash');
+      if (key === 'guide') return go('guide');
+      if (key === 'appearance') return go('appearance');
+    };
+  });
+
+  offlineDiagnostics().then(state => {
+    const card = document.getElementById('offlineCard');
+    if (!card) return;
+    card.innerHTML = `
+      <div class="offline-line">
+        <span class="offline-dot ${state.ready ? 'ok' : 'wait'}"></span>${esc(state.sw)}
+      </div>
+      <div class="offline-line">
+        <span class="offline-dot ${state.persisted ? 'ok' : 'warn'}"></span>${esc(state.persist)}
+      </div>
+      ${state.usage ? `<div class="offline-line offline-usage">${esc(state.usage)}</div>` : ''}
+      ${state.persisted ? '' : `
+        <p class="offline-hint">
+          Installe l’app sur l’écran d’accueil pour que le navigateur ne
+          puisse plus effacer tes données.
+        </p>`}
+    `;
   });
 }
 
-function openHomeSettings() {
+function screenAppearance() {
   const initial = getHomeAppearance();
 
-  openDialog('Paramètres de l’accueil', `
-    <form id="homeSettingsForm">
-      <p class="theme-help">Personnalise uniquement l’accueil général. Les thèmes de chaque projet restent indépendants.</p>
+  app.innerHTML = `
+    ${globalHeader('Apparence')}
+    <main>
+      <p class="theme-help">Ces couleurs ne concernent que l’accueil général. Chaque projet garde son thème indépendant.</p>
 
       ${themeColorField('homeHeader', 'Couleur du header', initial.header)}
       ${themeColorField('homeBackground', 'Fond de l’accueil', initial.background)}
@@ -1449,99 +3275,272 @@ function openHomeSettings() {
       </div>
 
       <button type="button" class="btn-ghost theme-reset" id="resetHomeAppearance">Réinitialiser</button>
-      <button type="submit" class="btn-accent quick">Enregistrer</button>
-    </form>
-  `, dialog => {
-    const controls = [
-      ['homeHeader', 'header'],
-      ['homeBackground', 'background']
-    ];
-    const onHome = stack.at(-1)?.name === 'home';
+      <button type="button" class="btn-accent quick" id="saveAppearance">Enregistrer</button>
+    </main>
+  `;
 
-    const readAppearance = () => Object.fromEntries(controls.map(([id, key]) => [
-      key,
-      normalizeHex(dialog.querySelector(`#${id}Text`).value)
-    ]));
+  bindGlobal();
 
-    const updatePreview = () => {
-      const appearance = readAppearance();
-      if (Object.values(appearance).some(value => !value)) return;
+  const controls = [['homeHeader', 'header'], ['homeBackground', 'background']];
 
-      const preview = dialog.querySelector('#homeThemePreview');
-      preview.style.setProperty('--home-preview-header', appearance.header);
-      preview.style.setProperty('--home-preview-header-text', contrast(appearance.header));
-      preview.style.setProperty('--home-preview-background', appearance.background);
-      preview.style.setProperty('--home-preview-background-text', contrast(appearance.background));
+  const readAppearance = () => Object.fromEntries(controls.map(([id, key]) => [
+    key,
+    normalizeHex(document.getElementById(`${id}Text`).value)
+  ]));
 
-      if (onHome) applyHomeAppearance(appearance);
-    };
+  const updatePreview = () => {
+    const appearance = readAppearance();
+    if (Object.values(appearance).some(value => !value)) return;
+    const preview = document.getElementById('homeThemePreview');
+    preview.style.setProperty('--home-preview-header', appearance.header);
+    preview.style.setProperty('--home-preview-header-text', contrast(appearance.header));
+    preview.style.setProperty('--home-preview-background', appearance.background);
+    preview.style.setProperty('--home-preview-background-text', contrast(appearance.background));
+  };
 
-    controls.forEach(([id]) => {
-      const picker = dialog.querySelector(`#${id}Picker`);
-      const text = dialog.querySelector(`#${id}Text`);
+  controls.forEach(([id]) => {
+    const picker = document.getElementById(`${id}Picker`);
+    const text = document.getElementById(`${id}Text`);
 
-      picker.oninput = () => {
-        text.value = picker.value.toUpperCase();
-        text.setAttribute('aria-invalid', 'false');
-        updatePreview();
-      };
-
-      text.oninput = () => {
-        const normalized = normalizeHex(text.value);
-        text.setAttribute('aria-invalid', String(!normalized));
-        if (normalized) {
-          picker.value = normalized;
-          updatePreview();
-        }
-      };
-
-      text.onblur = () => {
-        const normalized = normalizeHex(text.value);
-        if (normalized) text.value = normalized;
-      };
-    });
-
-    dialog.querySelector('#resetHomeAppearance').onclick = () => {
-      const defaults = homeAppearanceDefaults();
-      controls.forEach(([id, key]) => {
-        dialog.querySelector(`#${id}Picker`).value = defaults[key];
-        dialog.querySelector(`#${id}Text`).value = defaults[key];
-        dialog.querySelector(`#${id}Text`).setAttribute('aria-invalid', 'false');
-      });
+    picker.oninput = () => {
+      text.value = picker.value.toUpperCase();
+      text.setAttribute('aria-invalid', 'false');
       updatePreview();
     };
-
-    dialog.addEventListener('dialog-cancel', applyTheme, { once: true });
-    updatePreview();
-
-    dialog.querySelector('#homeSettingsForm').onsubmit = event => {
-      event.preventDefault();
-      const appearance = readAppearance();
-
-      if (Object.values(appearance).some(value => !value)) {
-        return toast('Vérifie les codes couleur. Utilise #RGB ou #RRGGBB.', true);
+    text.oninput = () => {
+      const normalized = normalizeHex(text.value);
+      text.setAttribute('aria-invalid', String(!normalized));
+      if (normalized) {
+        picker.value = normalized;
+        updatePreview();
       }
+    };
+    text.onblur = () => {
+      const normalized = normalizeHex(text.value);
+      if (normalized) text.value = normalized;
+    };
+  });
 
-      localStorage.setItem(HOME_APPEARANCE_KEY, JSON.stringify(appearance));
-      dialog.remove();
-      render();
-      toast('Paramètres de l’accueil enregistrés.');
+  document.getElementById('resetHomeAppearance').onclick = () => {
+    const defaults = homeAppearanceDefaults();
+    controls.forEach(([id, key]) => {
+      document.getElementById(`${id}Picker`).value = defaults[key];
+      document.getElementById(`${id}Text`).value = defaults[key];
+      document.getElementById(`${id}Text`).setAttribute('aria-invalid', 'false');
+    });
+    updatePreview();
+  };
+
+  document.getElementById('saveAppearance').onclick = () => {
+    const appearance = readAppearance();
+    if (Object.values(appearance).some(value => !value)) {
+      return toast('Vérifie les codes couleur. Utilise #RGB ou #RRGGBB.', true);
+    }
+    localStorage.setItem(HOME_APPEARANCE_KEY, JSON.stringify(appearance));
+    toast('Apparence enregistrée.');
+    goHome();
+  };
+
+  updatePreview();
+}
+
+/* Mémo des mécanismes qu'on oublie entre deux sessions. */
+const GUIDES = [
+  {
+    icon: '🔗',
+    title: 'Lier deux pages',
+    body: [
+      'Dans l’éditeur, tape <b>[[</b> : un sélecteur de page s’ouvre aussitôt.',
+      'Le bouton <b>🔗</b> de la barre d’outils fait la même chose.',
+      'En lecture, un lien vers une page supprimée s’affiche barré. Un lien vers la page courante s’affiche en gras, sans être cliquable.',
+      'En bas de chaque page, la section <b>Liens entrants</b> liste les pages qui pointent vers elle.'
+    ]
+  },
+  {
+    icon: '✍️',
+    title: 'Écrire une page',
+    body: [
+      'Le bouton <b>Modifier</b> ouvre directement le clavier, curseur en fin de texte.',
+      'L’écran d’écriture ne contient que le titre et le texte : couverture, catégories, fiche et galerie sont dans le menu <b>⋮</b> en haut à droite.',
+      'La barre du bas donne : gras, italique, barré, titres, listes, citation, code, séparateur et lien.',
+      'Tout est enregistré <b>automatiquement</b> une seconde après la dernière frappe, et aussi quand tu quittes l’écran.',
+      'Un sommaire apparaît tout seul en lecture dès qu’une page a <b>trois titres</b> ou plus.'
+    ]
+  },
+  {
+    icon: '🗂',
+    title: 'Fiche d’information (infobox)',
+    body: [
+      'Sur une page, <b>⋮ → Ajouter une fiche</b>. C’est le tableau récapitulatif en tête d’article.',
+      'Quatre briques : <b>titre</b>, <b>image</b>, <b>ligne</b> (nom + valeur), <b>section</b> (regroupe les lignes suivantes).',
+      'Les flèches <b>↑ ↓</b> réordonnent, le <b>×</b> retire.',
+      'Un champ laissé vide ne s’affiche pas. Une section sans champ rempli disparaît aussi. Rien à nettoyer.',
+      'Le contenu de la fiche est <b>cherchable</b> : tu peux retrouver une page par la valeur d’un de ses champs.',
+      'Ça marche pour tout : personnage (Espèce, Rang), lieu (Région, Population), prompt (Modèle, Verdict, Testé le).'
+    ]
+  },
+  {
+    icon: '📥',
+    title: 'Importer depuis JSON',
+    body: [
+      '<b>Paramètres → Importer depuis JSON</b>, ou <b>⋮ → Importer</b> sur l’accueil d’un projet.',
+      'Colle ce qu’une IA a produit, choisis le projet, appuie sur <b>Analyser</b> puis <b>Importer</b>.',
+      'Clés reconnues : <b>title</b>, <b>body</b>, <b>categories</b>, <b>infobox</b> — les équivalents français marchent aussi (titre, contenu, catégories, fiche).',
+      'L’infobox accepte la forme simple <b>{ "Région": "Nord" }</b> ou la forme groupée avec <b>groups</b>.',
+      'Le texte peut être du markdown léger : <b>##</b> titres, <b>-</b> listes, <b>**gras**</b>.',
+      'Un <b>tableau</b> d’objets importe plusieurs pages d’un coup.',
+      'Les catégories nommées sont <b>créées automatiquement</b> si elles n’existent pas dans le projet.',
+      'Le bouton <b>Voir le format</b> insère un exemple complet à copier.'
+    ]
+  },
+  {
+    icon: '🔎',
+    title: 'Rechercher',
+    body: [
+      'Pendant la frappe, seuls les <b>titres</b> sont proposés. Valide pour lancer la recherche complète dans le texte.',
+      'Plusieurs mots : tous doivent être présents, dans n’importe quel ordre.',
+      '<b>-mot</b> exclut les pages contenant ce mot.',
+      '<b>"mot"</b> cherche le mot entier, sans variantes.',
+      'Les accents sont ignorés : <i>ecole</i> trouve <i>école</i>.',
+      'Le résultat montre le texte <b>autour</b> du mot trouvé, en gras.',
+      'Si rien ne correspond, la bannière du haut crée directement la page.'
+    ]
+  },
+  {
+    icon: '🗂',
+    title: 'Bibliothèque, tri et filtre',
+    body: [
+      'Chaque bouton <b>Voir tout</b> ouvre la bibliothèque : toutes les pages, celles d’un projet ou d’une catégorie.',
+      'Le champ du haut filtre à l’intérieur de l’écran courant.',
+      'Le bouton <b>▤ / ▦</b> bascule entre liste et grille. Le choix est retenu.',
+      'Le tri se choisit en deux temps : le <b>champ</b> (date, titre, taille) puis le <b>sens</b> avec la flèche ↓ / ↑.',
+      'Les pages épinglées remontent toujours en tête, quel que soit le tri.'
+    ]
+  },
+  {
+    icon: '✋',
+    title: 'Sélectionner plusieurs pages',
+    body: [
+      'Dans la bibliothèque, <b>reste appuyé</b> sur une page : le mode sélection s’active (courte vibration).',
+      'Touche ensuite les autres pages pour les ajouter.',
+      'Le <b>☑</b> du header sélectionne ou désélectionne tout l’écran.',
+      'Le <b>⋮</b> applique une action à tout le lot : épingler, déplacer, relier à une catégorie, mettre à la corbeille.',
+      'Relier à une catégorie exige que les pages soient dans le <b>même projet</b>.'
+    ]
+  },
+  {
+    icon: '🗑',
+    title: 'Corbeille',
+    body: [
+      `Supprimer une page ne la détruit pas : elle part en corbeille pour <b>${TRASH_DAYS} jours</b>.`,
+      'Un bandeau <b>Annuler</b> apparaît pendant 5 secondes juste après.',
+      'Une page en corbeille disparaît de l’accueil, des projets, de la recherche et du sélecteur de liens.',
+      'On peut encore l’ouvrir depuis un lien : un bandeau rouge propose de la restaurer.',
+      'La purge s’exécute <b>au lancement de l’app</b>, jamais en arrière-plan.',
+      '<b>Supprimer définitivement</b> est la seule action sans retour ; elle prévient des liens qui vont mourir.'
+    ]
+  },
+  {
+    icon: '★',
+    title: 'Épingler',
+    body: [
+      'Le bouton <b>☆ Épingler</b> est en haut de chaque page, à gauche de Modifier.',
+      'Les pages épinglées apparaissent en tête de l’accueil et dans le menu latéral.',
+      'C’est fait pour les pages d’index d’un projet, pas pour marquer une lecture.'
+    ]
+  },
+  {
+    icon: '📁',
+    title: 'Projets et catégories',
+    body: [
+      'Une page appartient à <b>un</b> projet, et peut porter <b>plusieurs</b> catégories de ce projet.',
+      'Le bouton <b>+ Ajouter</b> à côté de « Catégories » en crée une, dans n’importe quel modèle de projet.',
+      'Le nombre sur chaque vignette de catégorie est son nombre de pages.',
+      'Déplacer une page vers un autre projet <b>efface ses catégories</b> : elles appartenaient à l’ancien projet.',
+      'Supprimer un projet ne détruit aucune page : elles retournent dans l’Inbox.',
+      'Supprimer une catégorie ne supprime pas ses pages non plus.'
+    ]
+  },
+  {
+    icon: '💾',
+    title: 'Sauvegarde et hors ligne',
+    body: [
+      'L’app fonctionne <b>entièrement sans réseau</b> : elle démarre en mode avion.',
+      'Tout est stocké <b>sur ton téléphone</b>, jamais en ligne. Personne d’autre n’y a accès.',
+      'Installe l’app sur l’écran d’accueil : le stockage devient permanent et ne peut plus être purgé.',
+      '<b>Paramètres → Hors ligne</b> affiche l’état et l’espace utilisé.',
+      '<b>Exporter</b> télécharge un fichier .db unique contenant tout. À faire de temps en temps.',
+      '<b>Importer</b> remplace intégralement les données actuelles.',
+      'Quand une nouvelle version est disponible, un bandeau <b>Recharger</b> apparaît : rien ne change tant que tu n’appuies pas.',
+      'Seul l’<b>export PDF</b> a besoin d’internet.'
+    ]
+  },
+  {
+    icon: '🎨',
+    title: 'Thèmes',
+    body: [
+      'Chaque projet a ses <b>4 couleurs</b> : accent, barre du projet, fond du wiki, fond des articles.',
+      'Le fond des articles reprend une pointe de la couleur du projet, pour lui donner une ambiance.',
+      'Le header noir et la barre système restent identiques partout : c’est le repère fixe.',
+      '<b>Paramètres → Apparence</b> ne change que l’accueil général.',
+      'Une page sans image reçoit une <b>couleur calculée depuis son titre</b> : elle garde toujours la même.'
+    ]
+  }
+];
+
+function screenGuide() {
+  app.innerHTML = `
+    ${globalHeader('Guide')}
+    <main>
+      <p class="theme-help">Un rappel de chaque mécanisme, pour ne pas avoir à les redécouvrir.</p>
+      <div class="guide-list">
+        ${GUIDES.map((guide, index) => `
+          <div class="guide-item">
+            <button type="button" class="guide-head" data-guide="${index}" aria-expanded="false">
+              <span class="guide-ico">${guide.icon}</span>
+              <span class="guide-t">${esc(guide.title)}</span>
+              <span class="guide-chev" aria-hidden="true">⌄</span>
+            </button>
+            <div class="guide-body" hidden>
+              <ul>${guide.body.map(line => `<li>${line}</li>`).join('')}</ul>
+            </div>
+          </div>
+        `).join('')}
+      </div>
+    </main>
+  `;
+
+  bindGlobal();
+  app.querySelectorAll('[data-guide]').forEach(button => {
+    button.onclick = () => {
+      const body = button.nextElementSibling;
+      const open = button.getAttribute('aria-expanded') === 'true';
+      button.setAttribute('aria-expanded', String(!open));
+      body.hidden = open;
     };
   });
 }
 
 function openGlobalDrawer() {
+  const trashed = trashCount();
   const overlay = document.createElement('div');
   overlay.className = 'drawer-overlay';
   overlay.innerHTML = `
     <aside class="drawer">
-      <div class="drawer-head">${logoHTML()}<button type="button" class="icon-btn" data-close aria-label="Fermer">X</button></div>
-      <nav class="drawer-nav"><button type="button" class="dr-item" data-route="home"><span class="dr-ico">⌂</span>Accueil</button><button type="button" class="dr-item" data-route="inbox"><span class="dr-ico">📥</span>Inbox</button><button type="button" class="dr-item" data-route="templates"><span class="dr-ico">🧩</span>Templates</button></nav>
+      <div class="drawer-head">${logoHTML()}<button type="button" class="icon-btn" data-close aria-label="Fermer">${icon('close', 22)}</button></div>
+      <nav class="drawer-nav">
+        <button type="button" class="dr-item" data-route="home"><span class="dr-ico">${icon('home')}</span>Accueil</button>
+        <button type="button" class="dr-item" data-route="inbox"><span class="dr-ico">${icon('inbox')}</span>Inbox</button>
+        <button type="button" class="dr-item" data-route="library:all"><span class="dr-ico">${icon('pages')}</span>Toutes les pages</button>
+        <button type="button" class="dr-item" data-route="library:pinned"><span class="dr-ico">${icon('pin')}</span>Épinglées</button>
+        <button type="button" class="dr-item" data-route="templates"><span class="dr-ico">${icon('templates')}</span>Templates</button>
+        <button type="button" class="dr-item" data-route="trash"><span class="dr-ico">${icon('trash')}</span>Corbeille${trashed ? `<span class="badge dr-badge">${trashed}</span>` : ''}</button>
+      </nav>
       <div class="drawer-sep"></div>
-      <button type="button" class="dr-item" id="exportDB"><span class="dr-ico">💾</span>Exporter mes données</button>
-      <button type="button" class="dr-item" id="importDB"><span class="dr-ico">📂</span>Importer une sauvegarde</button>
-      <button type="button" class="dr-item" id="theme"><span class="dr-ico">◐</span>Changer de thème</button>
-      <button type="button" class="dr-item" id="settings"><span class="dr-ico dr-ico-settings">⚙︎</span>Paramètres</button>
+      <button type="button" class="dr-item" id="exportDB"><span class="dr-ico">${icon('export')}</span>Exporter mes données</button>
+      <button type="button" class="dr-item" id="importDB"><span class="dr-ico">${icon('import')}</span>Importer une sauvegarde</button>
+      <button type="button" class="dr-item" id="theme"><span class="dr-ico">${icon('theme')}</span>Changer de thème</button>
+      <button type="button" class="dr-item" id="settings"><span class="dr-ico">${icon('settings')}</span>Paramètres</button>
     </aside>
   `;
   document.body.appendChild(overlay);
@@ -1556,7 +3555,10 @@ function openGlobalDrawer() {
   };
   overlay.querySelectorAll('[data-route]').forEach(button => button.onclick = () => {
     close();
-    button.dataset.route === 'home' ? goHome() : go(button.dataset.route);
+    const route = button.dataset.route;
+    if (route === 'home') return goHome();
+    if (route.startsWith('library:')) return go('library', route.slice(8));
+    go(route);
   });
   overlay.querySelector('#exportDB').onclick = () => {
     close();
@@ -1570,10 +3572,11 @@ function openGlobalDrawer() {
     document.documentElement.dataset.theme = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
     localStorage.setItem('theme', document.documentElement.dataset.theme);
     close();
+    render();
   };
   overlay.querySelector('#settings').onclick = () => {
     close();
-    setTimeout(openHomeSettings, 250);
+    go('settings');
   };
 }
 
@@ -1581,10 +3584,19 @@ function openContextDrawer() {
   const space = currentSpace();
   if (!space) return;
   const categories = getSpaceCategories(space.id);
-  const pages = q('SELECT id,title FROM pages WHERE space_id = ? ORDER BY updated_at DESC LIMIT 50', [space.id]);
+  const pages = q('SELECT id,title FROM pages WHERE space_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT 50', [space.id]);
   const overlay = document.createElement('div');
   overlay.className = 'drawer-overlay';
-  overlay.innerHTML = `<aside class="drawer ctx-drawer"><div class="drawer-head"><strong>${esc(space.name)}</strong><button type="button" class="icon-btn" data-close aria-label="Fermer">X</button></div><button type="button" class="dr-item" data-home>Accueil du projet</button><div class="drawer-sep"></div>${categories.map(category => `<button type="button" class="dr-item" data-category="${esc(category.id)}">${esc(category.name)}</button>`).join('')}<div class="drawer-sep"></div>${pages.map(page => `<button type="button" class="dr-item" data-page="${esc(page.id)}">${esc(page.title?.trim() || 'Sans titre')}</button>`).join('')}</aside>`;
+  overlay.innerHTML = `
+    <aside class="drawer ctx-drawer">
+      <div class="drawer-head"><strong>${esc(space.name)}</strong><button type="button" class="icon-btn" data-close aria-label="Fermer">${icon('close', 22)}</button></div>
+      <button type="button" class="dr-item" data-home><span class="dr-ico">${icon('home')}</span>Accueil du projet</button>
+      <div class="drawer-sep"></div>
+      ${categories.map(category => `<button type="button" class="dr-item" data-category="${esc(category.id)}"><span class="dr-ico">${icon('folder')}</span>${esc(category.name)}</button>`).join('')}
+      <div class="drawer-sep"></div>
+      ${pages.map(page => `<button type="button" class="dr-item" data-page="${esc(page.id)}"><span class="dr-ico">${icon('doc')}</span>${esc(displayTitle(page.title))}</button>`).join('')}
+    </aside>
+  `;
   document.body.appendChild(overlay);
   requestAnimationFrame(() => overlay.classList.add('open'));
   const close = () => {
@@ -1592,6 +3604,9 @@ function openContextDrawer() {
     setTimeout(() => overlay.remove(), 240);
   };
   overlay.querySelector('[data-close]').onclick = close;
+  overlay.onclick = event => {
+    if (event.target === overlay) close();
+  };
   overlay.querySelector('[data-home]').onclick = () => {
     close();
     go('space', space.id);
@@ -1603,6 +3618,233 @@ function openContextDrawer() {
   overlay.querySelectorAll('[data-page]').forEach(button => button.onclick = () => {
     close();
     go('read', button.dataset.page);
+  });
+}
+
+/* ============================================================
+   Import JSON — pour récupérer ce qu'une IA produit sans
+   avoir à recopier à la main.
+   ============================================================ */
+
+/* Texte brut ou markdown léger vers HTML. On ne gère que ce qu'un
+   modèle produit couramment : titres, listes, gras, italique, citations. */
+function textToHTML(input) {
+  const source = String(input ?? '').replace(/\r\n/g, '\n').trim();
+  if (!source) return '';
+  if (/^\s*<(p|h[1-6]|ul|ol|blockquote|div)\b/i.test(source)) return sanitizeHTML(source);
+
+  const inline = text => esc(text)
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*([^*]+)\*/g, '$1<em>$2</em>')
+    .replace(/__([^_]+)__/g, '<strong>$1</strong>');
+
+  const out = [];
+  let list = null;
+
+  const closeList = () => {
+    if (list) {
+      out.push(`<ul>${list.join('')}</ul>`);
+      list = null;
+    }
+  };
+
+  source.split('\n').forEach(rawLine => {
+    const line = rawLine.trim();
+    if (!line) return closeList();
+
+    const heading = line.match(/^(#{2,4})\s+(.*)$/);
+    if (heading) {
+      closeList();
+      const level = Math.min(4, heading[1].length);
+      out.push(`<h${level}>${inline(heading[2])}</h${level}>`);
+      return;
+    }
+    if (/^#\s+/.test(line)) {
+      closeList();
+      out.push(`<h2>${inline(line.replace(/^#\s+/, ''))}</h2>`);
+      return;
+    }
+    if (/^[-*•]\s+/.test(line)) {
+      list = list || [];
+      list.push(`<li>${inline(line.replace(/^[-*•]\s+/, ''))}</li>`);
+      return;
+    }
+    if (/^>\s?/.test(line)) {
+      closeList();
+      out.push(`<blockquote><p>${inline(line.replace(/^>\s?/, ''))}</p></blockquote>`);
+      return;
+    }
+    if (/^(-{3,}|_{3,})$/.test(line)) {
+      closeList();
+      out.push('<hr>');
+      return;
+    }
+    closeList();
+    out.push(`<p>${inline(line)}</p>`);
+  });
+
+  closeList();
+  return sanitizeHTML(out.join(''));
+}
+
+/* Très permissif : un objet, un tableau d'objets, ou { pages: [...] }.
+   Les clés françaises et anglaises sont acceptées. */
+function extractPages(data) {
+  const list = Array.isArray(data) ? data
+    : Array.isArray(data?.pages) ? data.pages
+    : data && typeof data === 'object' ? [data]
+    : [];
+
+  return list
+    .map(item => {
+      if (!item || typeof item !== 'object') return null;
+      const title = String(item.title ?? item.titre ?? item.nom ?? item.name ?? '').trim();
+      const body = item.body ?? item.contenu ?? item.content ?? item.texte ?? item.text ?? '';
+      const rawCats = item.categories ?? item.categorie ?? item.category ?? item.tags ?? [];
+      const categories = (Array.isArray(rawCats) ? rawCats : String(rawCats).split(','))
+        .map(value => String(value).trim())
+        .filter(Boolean);
+      const infobox = normalizeInfobox(item.infobox ?? item.fiche ?? item.attributs ?? item.attributes ?? null);
+      if (!title && !body && !infobox) return null;
+      return { title: title || UNTITLED, body: textToHTML(body), categories, infobox };
+    })
+    .filter(Boolean);
+}
+
+function importJSON(defaultSpaceId = null) {
+  const spaces = q('SELECT id,name FROM spaces ORDER BY name COLLATE NOCASE');
+
+  openDialog('Importer depuis JSON', `
+    <p class="theme-help">Colle ce qu’une IA t’a généré. Une page, ou plusieurs dans un tableau. Les champs manquants sont simplement ignorés.</p>
+
+    <label class="lab" for="jsonSpace">Projet de destination</label>
+    <select class="field" id="jsonSpace">
+      <option value="">📥 Inbox</option>
+      ${spaces.map(item => `<option value="${esc(item.id)}"${item.id === defaultSpaceId ? ' selected' : ''}>${esc(item.name)}</option>`).join('')}
+    </select>
+
+    <label class="lab" for="jsonInput">Contenu JSON</label>
+    <textarea class="field json-input" id="jsonInput" rows="9" spellcheck="false" placeholder='{ "title": "Ymir", "body": "...", "infobox": { "Région": "Nord" } }'></textarea>
+
+    <div class="json-actions">
+      <button type="button" class="btn-ghost" id="jsonFile">Depuis un fichier</button>
+      <button type="button" class="btn-ghost" id="jsonModel">Voir le format</button>
+    </div>
+
+    <div id="jsonPreview"></div>
+    <button type="button" class="btn-accent quick" id="jsonRun">Analyser</button>
+  `, dialog => {
+    const input = dialog.querySelector('#jsonInput');
+    const preview = dialog.querySelector('#jsonPreview');
+    let pending = [];
+
+    dialog.querySelector('#jsonFile').onclick = () => {
+      const file = document.createElement('input');
+      file.type = 'file';
+      file.accept = '.json,application/json,text/plain';
+      file.onchange = async () => {
+        const chosen = file.files?.[0];
+        if (!chosen) return;
+        input.value = await chosen.text();
+        toast('Fichier chargé. Appuie sur Analyser.');
+      };
+      file.click();
+    };
+
+    dialog.querySelector('#jsonModel').onclick = () => {
+      input.value = JSON.stringify({
+        title: 'Ymir',
+        categories: ['Lieux'],
+        infobox: {
+          subtitle: 'Cité-état',
+          groups: [
+            { header: 'Géographie', rows: [{ label: 'Région', value: 'Détroit noir' }] },
+            { header: 'Société', rows: [{ label: 'Population', value: '34 000' }] }
+          ]
+        },
+        body: '## Histoire\nLa cité naît d\'un refus.\n\n- Premier point\n- Second point'
+      }, null, 2);
+    };
+
+    dialog.querySelector('#jsonRun').onclick = () => {
+      const raw = input.value.trim();
+      if (!raw) return toast('Colle d’abord du JSON.', true);
+
+      let data;
+      try {
+        data = JSON.parse(raw);
+      } catch (error) {
+        preview.innerHTML = `<div class="json-error">JSON invalide : ${esc(error.message)}</div>`;
+        return;
+      }
+
+      pending = extractPages(data);
+      if (!pending.length) {
+        preview.innerHTML = '<div class="json-error">Aucune page exploitable. Il faut au moins un titre, un texte ou une fiche.</div>';
+        return;
+      }
+
+      preview.innerHTML = `
+        <div class="json-ok">${pending.length} ${plural(pending.length, 'page')} ${pending.length > 1 ? 'prêtes' : 'prête'} à importer</div>
+        <div class="picker-list json-list">
+          ${pending.map(item => `
+            <div class="picker-item">
+              <b>${esc(item.title)}</b>
+              <span class="json-meta">${item.infobox && !infoboxIsEmpty(item.infobox) ? '🗂 fiche · ' : ''}${item.categories.length ? `${item.categories.length} ${plural(item.categories.length, 'catégorie')} · ` : ''}${strip(item.body).length} caractères</span>
+            </div>`).join('')}
+        </div>
+        <button type="button" class="btn-accent quick" id="jsonConfirm">Importer</button>
+      `;
+
+      preview.querySelector('#jsonConfirm').onclick = async () => {
+        const spaceId = dialog.querySelector('#jsonSpace').value || null;
+        const now = Date.now();
+        let created = 0;
+
+        transaction(() => {
+          pending.forEach(item => {
+            const id = uid();
+            const infoboxJSON = item.infobox && !infoboxIsEmpty(item.infobox)
+              ? JSON.stringify(item.infobox)
+              : '{}';
+
+            run(`INSERT INTO pages (id,title,body,created_at,updated_at,is_inbox,space_id,infobox,title_align,search_text)
+                 VALUES (?,?,?,?,?,?,?,?,?,?)`, [
+              id, item.title, item.body, now, now,
+              spaceId ? 0 : 1, spaceId, infoboxJSON, 'left',
+              buildSearchText(item.title, item.body, infoboxJSON)
+            ]);
+
+            /* Les catégories nommées sont créées à la volée si besoin —
+               comme les « wanted categories » de Fandom. */
+            if (spaceId) {
+              item.categories.forEach(name => {
+                const existing = q(
+                  'SELECT id FROM categories WHERE space_id = ? AND LOWER(name) = LOWER(?)',
+                  [spaceId, name]
+                )[0];
+                let categoryId = existing?.id;
+                if (!categoryId) {
+                  categoryId = uid();
+                  const max = q('SELECT MAX(position) position FROM categories WHERE space_id = ?', [spaceId])[0].position;
+                  run('INSERT INTO categories (id,space_id,name,intro,banner,position,created_at) VALUES (?,?,?,?,?,?,?)',
+                    [categoryId, spaceId, name, '', null, (max ?? -1) + 1, now]);
+                }
+                run('INSERT OR IGNORE INTO page_categories (page_id,category_id) VALUES (?,?)', [id, categoryId]);
+              });
+            }
+            created += 1;
+          });
+        });
+
+        await saveDB();
+        dialog.remove();
+        if (spaceId) go('space', spaceId); else go('library', 'inbox');
+        toast(`${created} ${plural(created, 'page')} ${created > 1 ? 'importées' : 'importée'}.`);
+      };
+    };
+
+    input.focus();
   });
 }
 
@@ -1633,6 +3875,7 @@ function importDB() {
       confirmDialog('Importer cette sauvegarde ?', 'Les données actuelles seront remplacées.', async () => {
         const previous = db;
         db = next;
+        invalidateSpaces();
         try {
           run('PRAGMA foreign_keys = ON');
           const spaceColumns = new Set(q('PRAGMA table_info(spaces)').map(column => column.name));
@@ -1644,8 +3887,19 @@ function importDB() {
           ].forEach(([column, type]) => {
             if (!spaceColumns.has(column)) run(`ALTER TABLE spaces ADD COLUMN ${column} ${type}`);
           });
-          // La base validée est déjà utilisable en mémoire. On affiche
-          // l'accueil avant l'export et l'écriture potentiellement coûteux.
+
+          /* Sans ces colonnes, toute la recherche planterait sur une
+             sauvegarde antérieure. */
+          const pageColumns = new Set(q('PRAGMA table_info(pages)').map(column => column.name));
+          if (!pageColumns.has('search_text')) run('ALTER TABLE pages ADD COLUMN search_text TEXT');
+          if (!pageColumns.has('deleted_at')) run('ALTER TABLE pages ADD COLUMN deleted_at INTEGER');
+
+          const categoryColumns = new Set(q('PRAGMA table_info(categories)').map(column => column.name));
+          if (!categoryColumns.has('parent_id')) run('ALTER TABLE categories ADD COLUMN parent_id TEXT');
+          if (!categoryColumns.has('color')) run('ALTER TABLE categories ADD COLUMN color TEXT');
+
+          backfillSearchText();
+
           goHome();
           toast('Données chargées. Enregistrement en cours...');
 
@@ -1666,6 +3920,7 @@ function importDB() {
           });
         } catch (error) {
           db = previous;
+          invalidateSpaces();
           next.close();
           toast(`Import impossible : ${error.message}`, true);
         }
@@ -1678,22 +3933,38 @@ function importDB() {
 }
 
 function cleanup() {
+  /* En premier : la frappe en cours doit atterrir en base avant que
+     l'éditeur ne disparaisse. */
+  if (editorFlushNow) {
+    try { editorFlushNow(); } catch { /* non bloquant */ }
+    editorFlushNow = null;
+  }
+  if (editorFlush) {
+    document.removeEventListener('visibilitychange', editorFlush);
+    window.removeEventListener('pagehide', editorFlush);
+    editorFlush = null;
+  }
   if (editor) {
     editor.destroy();
     editor = null;
   }
+  closeActiveMenu?.();
+  selection.clear();
   document.querySelectorAll('.overlay, .drawer-overlay, .quick-page-menu').forEach(element => element.remove());
 }
 
+/* ---- Navigation ----
+   La profondeur de pile est stockée dans history.state : c'est elle qui
+   fait autorité au retour, ce qui empêche stack et history de diverger. */
 function go(name, param = null) {
   stack.push({ name, param });
-  history.pushState({ app: true }, '');
+  history.pushState({ app: true, depth: stack.length }, '');
   render();
 }
 
 function replaceCurrent(name, param = null) {
   stack[stack.length - 1] = { name, param };
-  history.replaceState({ app: true }, '');
+  history.replaceState({ app: true, depth: stack.length }, '');
   render();
 }
 
@@ -1703,13 +3974,19 @@ function back() {
 }
 
 function goHome() {
+  const steps = stack.length - 1;
+  if (steps > 0) {
+    history.go(-steps);
+    return;
+  }
   stack = [{ name: 'home' }];
-  history.replaceState({ app: true }, '');
+  history.replaceState({ app: true, depth: 1 }, '');
   render();
 }
 
 function render() {
   cleanup();
+  invalidateSpaces();
   applyTheme();
   const route = stack.at(-1) || { name: 'home' };
   const routes = {
@@ -1718,41 +3995,76 @@ function render() {
     space: screenSpace,
     category: screenCategory,
     inbox: screenInbox,
-    recent: screenRecent,
+    recent: () => replaceCurrent('library', 'all'),
     search: screenSearch,
     edit: screenEdit,
     read: screenRead,
     templates: screenTemplates,
-    gallery: screenGallery
+    gallery: screenGallery,
+    trash: screenTrash,
+    library: screenLibrary,
+    settings: screenSettings,
+    appearance: screenAppearance,
+    guide: screenGuide
   };
   app.innerHTML = '<div class="empty">Chargement...</div>';
   (routes[route.name] || screenHome)(route.param);
   window.scrollTo(0, 0);
 }
 
-function toast(message, error = false) {
+function toast(message, error = false, action = null) {
+  document.querySelectorAll('.toast').forEach(element => element.remove());
+
   const element = document.createElement('div');
   element.className = `toast${error ? ' err' : ''}`;
   element.setAttribute('role', error ? 'alert' : 'status');
-  element.textContent = message;
+
+  const label = document.createElement('span');
+  label.textContent = message;
+  element.appendChild(label);
+
+  if (action) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'toast-action';
+    button.textContent = action.label;
+    button.onclick = () => {
+      element.remove();
+      action.run();
+    };
+    element.appendChild(button);
+  }
+
   document.body.appendChild(element);
   requestAnimationFrame(() => element.classList.add('show'));
   setTimeout(() => {
     element.classList.remove('show');
     setTimeout(() => element.remove(), 250);
-  }, 2400);
+  }, action ? (action.duration || 5000) : 2400);
 }
 
-window.addEventListener('popstate', () => {
-  if (stack.length > 1) stack.pop();
+window.addEventListener('popstate', event => {
+  const depth = event.state?.depth || 1;
+  stack = stack.slice(0, depth);
+  if (!stack.length) stack = [{ name: 'home' }];
   render();
+});
+
+/* Une nouvelle version est prête mais n'a pas pris le pouvoir : c'est
+   l'utilisateur qui décide quand basculer, jamais en pleine frappe. */
+window.addEventListener('wiki:update-ready', () => {
+  toast('Nouvelle version disponible', false, {
+    label: 'Recharger',
+    duration: 12000,
+    run: () => window.applyWikiUpdate?.()
+  });
 });
 
 document.documentElement.dataset.theme = localStorage.getItem('theme') || 'dark';
 
 try {
   await initDB();
-  history.replaceState({ app: true }, '');
+  history.replaceState({ app: true, depth: 1 }, '');
   render();
 } catch (error) {
   app.innerHTML = `<div class="empty" role="alert">Erreur : ${esc(error.message || error)}</div>`;

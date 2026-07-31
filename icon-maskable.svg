@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Fond plein bord à bord : le lanceur peut rogner sans laisser de vide. -->
+  <rect width="512" height="512" fill="#0C0C0C"/>
+  <!-- Contenu réduit à ~60 % et centré : il reste entier dans la zone
+       de sécurité des masques circulaires (80 % centraux). -->
+  <g transform="translate(256 256) scale(0.62) translate(-256 -256)">
+    <polyline points="112,158 170,352 256,222 342,352 400,158"
+              fill="none" stroke="#FFC500" stroke-width="48"
+              stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

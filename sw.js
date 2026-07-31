@@ -1,59 +1,111 @@
-const CACHE_NAME = 'wiki-shell-v12';
+/* ============================================================
+   Service Worker — Wiki
+   Objectif : l'application démarre en mode avion.
+
+   Deux règles qui changent tout par rapport à la version v13 :
+
+   1. TOUT est same-origin. Plus aucune dépendance CDN au démarrage,
+      donc plus aucune réponse « opaque » impossible à valider.
+      addAll() est strict : si un fichier manque, l'installation
+      échoue franchement au lieu de laisser l'app à moitié cassée.
+
+   2. PAS de skipWaiting() automatique. Une nouvelle version s'installe
+      en silence puis ATTEND. C'est l'utilisateur qui déclenche la
+      bascule via le bandeau « Recharger », jamais en pleine frappe.
+   ============================================================ */
+
+const VERSION = 'v14';
+const CACHE_NAME = `wiki-${VERSION}`;
+
+/* Coquille complète : tout ce qu'il faut pour démarrer sans réseau. */
 const APP_SHELL = [
   './',
   './index.html',
   './app.js',
   './style.css',
   './manifest.webmanifest',
-  './icon.svg'
+  './tiptap.js',
+  './sql-wasm.js',
+  './sql-wasm.wasm',
+  './rubik.woff2',
+  './icon.svg',
+  './icon-maskable.svg',
+  './icon-192.png',
+  './icon-512.png',
+  './apple-touch-icon.png'
 ];
 
 self.addEventListener('install', event => {
   event.waitUntil(
-    caches.open(CACHE_NAME)
-      .then(cache => cache.addAll(APP_SHELL))
-      .then(() => self.skipWaiting())
+    caches.open(CACHE_NAME).then(cache =>
+      /* Strict : on veut savoir tout de suite si un fichier manque. */
+      cache.addAll(APP_SHELL.map(url => new Request(url, { cache: 'reload' })))
+    )
+    /* Volontairement pas de skipWaiting() ici. */
   );
 });
 
 self.addEventListener('activate', event => {
   event.waitUntil(
-    caches.keys()
-      .then(keys => Promise.all(keys.filter(key => key !== CACHE_NAME).map(key => caches.delete(key))))
-      .then(() => self.clients.claim())
+    (async () => {
+      const keys = await caches.keys();
+      await Promise.all(
+        keys.filter(key => key !== CACHE_NAME).map(key => caches.delete(key))
+      );
+      await self.clients.claim();
+    })()
   );
 });
 
-self.addEventListener('fetch', event => {
-  if (event.request.method !== 'GET') return;
+/* La page demande la bascule quand l'utilisateur appuie sur « Recharger ». */
+self.addEventListener('message', event => {
+  if (event.data === 'SKIP_WAITING') self.skipWaiting();
+});
 
-  if (event.request.mode === 'navigate') {
-    event.respondWith(
-      fetch(event.request)
-        .then(response => {
-          const copy = response.clone();
-          caches.open(CACHE_NAME).then(cache => cache.put('./index.html', copy));
-          return response;
-        })
-        .catch(() => caches.match('./index.html'))
-    );
+/* ---- Stratégie de lecture ----
+   Cache d'abord (démarrage instantané, y compris hors ligne), puis
+   revalidation en arrière-plan pour préparer la version suivante. */
+function staleWhileRevalidate(request, fallbackKey) {
+  return caches.open(CACHE_NAME).then(async cache => {
+    const cached = await cache.match(fallbackKey || request);
+
+    const network = fetch(request)
+      .then(response => {
+        if (response && response.ok && response.type === 'basic') {
+          cache.put(fallbackKey || request, response.clone());
+        }
+        return response;
+      })
+      .catch(() => null);
+
+    if (cached) return cached;
+
+    const fresh = await network;
+    if (fresh) return fresh;
+
+    return new Response('Hors ligne et ressource absente du cache.', {
+      status: 503,
+      statusText: 'Offline',
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+    });
+  });
+}
+
+self.addEventListener('fetch', event => {
+  const request = event.request;
+  if (request.method !== 'GET') return;
+
+  const url = new URL(request.url);
+
+  /* Ressources externes (html2pdf chargé à la demande) : réseau direct,
+     jamais mises en cache. Une réponse opaque ne peut pas être validée. */
+  if (url.origin !== self.location.origin) return;
+
+  /* Navigation : on sert toujours la coquille locale. */
+  if (request.mode === 'navigate') {
+    event.respondWith(staleWhileRevalidate(request, './index.html'));
     return;
   }
 
-  event.respondWith(
-    caches.match(event.request).then(cached => {
-      const network = fetch(event.request).then(response => {
-        if (response.ok) {
-          const copy = response.clone();
-          caches.open(CACHE_NAME).then(cache => cache.put(event.request, copy));
-        }
-        return response;
-      });
-      if (cached) {
-        event.waitUntil(network.catch(() => {}));
-        return cached;
-      }
-      return network;
-    })
-  );
+  event.respondWith(staleWhileRevalidate(request));
 });
